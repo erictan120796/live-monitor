@@ -1,0 +1,6 @@
+.wrapper-test-*/
+node_modules/
+coverage/
+# Never track production evidence or prompts.
+runs/
+*.live-monitor.lock

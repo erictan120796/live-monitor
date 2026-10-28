@@ -1,0 +1,10 @@
+{
+  "name": "live-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "File-backed live agent monitor — Phase 1 run protocol and wrappers",
+  "engines": { "node": ">=24" },
+  "scripts": { "test": "node --test" },
+  "license": "UNLICENSED"
+}
