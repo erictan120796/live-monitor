@@ -1,9 +1,10 @@
-# Live Monitor — Phase 1
+# Live Monitor
 
-Durable, file-backed PowerShell agent wrappers. Node never launches agents.
-This phase does **not** ship discovery, token accounting, HTTP/SSE or a UI.
-No production dependencies; Node 24+ for tests. Windows PowerShell 5.1 or
-PowerShell 7 for wrappers. Agent CLIs installed/authenticated separately.
+Durable, file-backed PowerShell agent wrappers plus a read-only local monitor.
+The server never launches agents and never deletes run evidence.
+No production dependencies; Node 24+ for the server and tests. Windows
+PowerShell 5.1 or PowerShell 7 for wrappers. Agent CLIs installed/authenticated
+separately.
 
 ## Test
 
@@ -63,7 +64,7 @@ silently overwritten. Without `OutFile`, every capture is inside its run folder.
 | Runs root | `C:\Users\User\.orchestrator\runs` (`$HOME\.orchestrator\runs`) |
 | Override | `LIVE_MONITOR_RUNS`, or wrapper `-RunsRoot` |
 | Codex sessions root | `C:\Users\User\.codex\sessions` (`$HOME\.codex\sessions`) |
-| Future monitor address | `127.0.0.1:5180` (no listener in Phase 1) |
+| Monitor address | `127.0.0.1:5180` (`PORT` overrides the port) |
 | Log retention policy | 30 days; optional manual `wrappers/prune-runs.ps1`; wrappers never delete |
 | Cursor permission policy | Preserve `--force` and `--trust`; separate from monitoring |
 | Codex sessions | New `exec` only; no `resume` support in v1 |
@@ -85,6 +86,27 @@ operator policy.
 .\wrappers\prune-runs.ps1
 .\wrappers\prune-runs.ps1 -RunsRoot $env:LIVE_MONITOR_RUNS -RetentionDays 30
 ```
+
+## Server
+
+```powershell
+npm start
+```
+
+Binds `127.0.0.1` only. `LIVE_MONITOR_RUNS` selects the runs root. Codex token
+enrichment reads `$HOME\.codex\sessions` and keeps the session file whose
+`session_meta` id equals that run's `thread_id`. It does not pick the newest
+session file. There is no resumed-session support in v1.
+
+- `GET /api/snapshot` — JSON runs with agent, model, effort, phase, status, timings, output tail, and tokens
+- `GET /api/events` — server-sent events for appended stdout lines, status changes, and heartbeats. No replay buffer and `Last-Event-ID` is ignored
+- `public/` — static files when that directory exists
+
+Cursor token counts are unavailable. Codex totals are cumulative snapshots: a
+later `turn.completed` usage or session `token_count` replaces the previous
+totals instead of adding to them. `used_percent` for primary and secondary rate
+limits comes from the matched session `token_count`. The server only reads
+evidence. Retention stays on the manual prune helper.
 
 ## Validation boundaries
 

@@ -3,8 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "File-backed live agent monitor — Phase 1 run protocol and wrappers",
+  "description": "File-backed live agent monitor",
   "engines": { "node": ">=24" },
-  "scripts": { "test": "node --test" },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test"
+  },
   "license": "UNLICENSED"
 }

@@ -159,5 +159,6 @@ are not inside the run folder and are never deleted. Active runs and runs
 without a terminal status (unknown/interrupted) are kept. The runs root itself
 is never removed. Legacy external captures need a separate operator policy.
 
-Monitor defaults reserved for later phases: bind `127.0.0.1`, port `5180`; no
-Phase 1 server exists. See README for deployment and controlled validation.
+The monitor binds `127.0.0.1` port `5180` (`PORT` overrides the port) and only
+reads evidence. It never deletes logs. See README for deployment and the
+server endpoints.
