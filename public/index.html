@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Live Monitor</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23181b21'/%3E%3Ccircle cx='8' cy='8' r='3' fill='%23d7a15a'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header id="app-header" data-region="header">
+    <h1>Live Monitor</h1>
+    <p id="runs-root">—</p>
+    <p id="connection" data-state="connecting">connecting</p>
+  </header>
+
+  <aside id="sidebar" data-region="sidebar">
+    <h2>Tasks</h2>
+    <div id="task-list"></div>
+  </aside>
+
+  <section id="timeline" data-region="timeline" aria-label="Phase timeline">
+    <h2>Phases</h2>
+    <ol id="phase-list">
+      <li data-phase="design" class="is-idle">
+        <button type="button" disabled>
+          <span class="phase-index">1</span>
+          <span class="phase-name">Design (GPT)</span>
+          <span class="phase-duration" data-duration="design">—</span>
+        </button>
+      </li>
+      <li data-phase="code" class="is-idle">
+        <button type="button" disabled>
+          <span class="phase-index">2</span>
+          <span class="phase-name">Code (Cursor)</span>
+          <span class="phase-duration" data-duration="code">—</span>
+        </button>
+      </li>
+      <li data-phase="review" class="is-idle">
+        <button type="button" disabled>
+          <span class="phase-index">3</span>
+          <span class="phase-name">Review (GPT)</span>
+          <span class="phase-duration" data-duration="review">—</span>
+        </button>
+      </li>
+      <li data-phase="fix" class="is-idle">
+        <button type="button" disabled>
+          <span class="phase-index">4</span>
+          <span class="phase-name">Fix</span>
+          <span class="phase-duration" data-duration="fix">—</span>
+        </button>
+      </li>
+    </ol>
+  </section>
+
+  <section id="agent-card" data-region="agent" aria-label="Current agent">
+    <h2>Current agent</h2>
+    <dl>
+      <div>
+        <dt>Agent</dt>
+        <dd id="agent-name">—</dd>
+      </div>
+      <div>
+        <dt>Model</dt>
+        <dd id="agent-model">—</dd>
+      </div>
+      <div>
+        <dt>Effort</dt>
+        <dd id="agent-effort">—</dd>
+      </div>
+      <div>
+        <dt>Phase</dt>
+        <dd id="agent-phase">—</dd>
+      </div>
+      <div>
+        <dt>Elapsed</dt>
+        <dd id="agent-elapsed">—</dd>
+      </div>
+    </dl>
+  </section>
+
+  <section id="output-panel" data-region="output" aria-label="Live output">
+    <h2>Live output</h2>
+    <p id="output-empty">Waiting for output</p>
+    <pre id="live-output" role="log"></pre>
+  </section>
+
+  <aside id="token-panel" data-region="tokens" data-state="empty" aria-label="Tokens">
+    <h2>Tokens</h2>
+    <p id="token-unavailable" hidden>unavailable</p>
+    <div id="token-metrics">
+      <div class="metric">
+        <span>Input</span>
+        <strong id="token-input">—</strong>
+      </div>
+      <div class="metric">
+        <span>Output</span>
+        <strong id="token-output">—</strong>
+      </div>
+      <div class="metric">
+        <span>Cached</span>
+        <strong id="token-cached">—</strong>
+      </div>
+      <div class="limit">
+        <div class="limit-label">
+          <span>5h</span>
+          <span id="limit-primary-value">—</span>
+        </div>
+        <div class="limit-track" id="limit-primary-track" role="meter" aria-label="5h limit" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="limit-primary-fill" class="limit-fill"></div>
+        </div>
+      </div>
+      <div class="limit">
+        <div class="limit-label">
+          <span>Weekly</span>
+          <span id="limit-secondary-value">—</span>
+        </div>
+        <div class="limit-track" id="limit-secondary-track" role="meter" aria-label="Weekly limit" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="limit-secondary-fill" class="limit-fill"></div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <noscript>JavaScript is required to load runs.</noscript>
+  <script src="/app.js"></script>
+</body>
+</html>

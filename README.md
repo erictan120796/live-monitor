@@ -4,7 +4,33 @@ Durable, file-backed PowerShell agent wrappers plus a read-only local monitor.
 The server never launches agents and never deletes run evidence.
 No production dependencies; Node 24+ for the server and tests. Windows
 PowerShell 5.1 or PowerShell 7 for wrappers. Agent CLIs installed/authenticated
-separately.
+separately. Start the monitor, deploy the wrappers, and use the run
+folder layout below.
+
+## Start
+
+```powershell
+npm start
+```
+
+Open http://127.0.0.1:5180. The process binds `127.0.0.1` only. `PORT` overrides
+the port. `LIVE_MONITOR_RUNS` overrides the runs root (default
+`C:\Users\User\.orchestrator\runs`). Codex token reads use
+`C:\Users\User\.codex\sessions`. v1 does not resume Codex sessions.
+
+The page is dark and read-only. It loads `GET /api/snapshot`, then follows
+`GET /api/events` and reconnects after a drop, refreshing the snapshot on
+events and heartbeats. Six regions:
+
+- Header: runs root and the SSE connection
+- Sidebar: runs grouped by `task_id`, with status badges
+- Timeline: Design (GPT), Code (Cursor), Review (GPT), and Fix, each with duration
+- Current agent: agent, model, effort, phase, and elapsed time
+- Live output: snapshot tail, then SSE updates, rendered as text
+- Tokens: input, output, and cached counts, plus 5h and weekly bars from primary and secondary `used_percent`
+
+Cursor runs show tokens unavailable. Output is text only. The monitor never
+launches agents and never deletes logs.
 
 ## Test
 
@@ -51,6 +77,26 @@ to 60 (fractional minutes supported). `Executable` selects a launcher explicitly
 Codex model/effort default to CLI configuration; Cursor model keeps the existing
 `grok-4.7-medium` default. No resumed Codex sessions in v1.
 
+## Run folder layout
+
+Default root: `C:\Users\User\.orchestrator\runs` (`$HOME\.orchestrator\runs`).
+`LIVE_MONITOR_RUNS`, or wrapper `-RunsRoot`, overrides it. Each invocation
+creates one folder. Related design, code, review, and fix runs share one
+`task_id` and keep distinct `run_id` values.
+
+```text
+<runs-root>\<run_id>\
+  manifest.json
+  status.jsonl
+  stdout.jsonl
+  stderr.log
+```
+
+Version checks may add `version.stdout.log`, `version.stderr.log`, and
+`version-launch.json`. `.ps1` launches may add `launch.json`. Cursor `-OutFile`
+captures stay at the given path, outside the run folder, with stderr at
+`<OutFile>.err`.
+
 `crun.ps1 -OutFile` remains supported: stdout uses that exact absolute-resolved
 path and stderr uses `<OutFile>.err`. Result fields remain `exit`, `duration_s`,
 `out`, `err`, with added `run_id`. Output format changes from text to JSONL.
@@ -89,18 +135,15 @@ operator policy.
 
 ## Server
 
-```powershell
-npm start
-```
+See [Start](#start). Static files are `public/index.html`, `public/app.js`, and
+`public/style.css`. Codex token enrichment reads `$HOME\.codex\sessions` and
+keeps the session file whose `session_meta` id equals that run's `thread_id`.
+It does not pick the newest session file. There is no resumed-session support
+in v1.
 
-Binds `127.0.0.1` only. `LIVE_MONITOR_RUNS` selects the runs root. Codex token
-enrichment reads `$HOME\.codex\sessions` and keeps the session file whose
-`session_meta` id equals that run's `thread_id`. It does not pick the newest
-session file. There is no resumed-session support in v1.
-
+- `GET /` — dark live monitor page
 - `GET /api/snapshot` — JSON runs with agent, model, effort, phase, status, timings, output tail, and tokens
-- `GET /api/events` — server-sent events for appended stdout lines, status changes, and heartbeats. No replay buffer and `Last-Event-ID` is ignored
-- `public/` — static files when that directory exists
+- `GET /api/events` — server-sent events for appended stdout lines, status changes, and heartbeats. No replay buffer and `Last-Event-ID` is ignored. The page reconnects and reloads the snapshot.
 
 Cursor token counts are unavailable. Codex totals are cumulative snapshots: a
 later `turn.completed` usage or session `token_count` replaces the previous
