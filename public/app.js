@@ -43,7 +43,6 @@ let showAllRuns = false;
 let source = null;
 let snapshotJob = null;
 let snapshotDirty = false;
-const cleared = new Map();
 
 function taskKey(run) {
   if (!run || run.task_id == null || run.task_id === '') return `run:${run?.run_id || ''}`;
@@ -414,12 +413,116 @@ function bindTiming(el, start, end) {
   el.textContent = formatDuration(elapsedMs(start, end, Date.now()));
 }
 
-function sameTail(left, right) {
-  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
-  for (let i = 0; i < left.length; i += 1) {
-    if (left[i] !== right[i]) return false;
+const outputMarks = new Map();
+
+function markFor(runId) {
+  let state = outputMarks.get(runId);
+  if (!state) {
+    state = { cutoff: 0, high: 0, nextSeq: 1, lines: [] };
+    outputMarks.set(runId, state);
+  }
+  return state;
+}
+
+function raiseHigh(state, seq) {
+  if (seq > state.high) state.high = seq;
+  if (seq >= state.nextSeq) state.nextSeq = seq + 1;
+}
+
+function tryConsume(prev, index, text) {
+  const line = prev[index];
+  if (!line || typeof text !== 'string') return null;
+  if (line.text === text) return { seq: line.seq, next: index + 1 };
+  if (!line.text || !text.startsWith(line.text)) return null;
+  let built = line.text;
+  let next = index + 1;
+  while (next < prev.length && prev[next].text && text.startsWith(built + prev[next].text)) {
+    built += prev[next].text;
+    next += 1;
+  }
+  if (line.partial || next > index + 1) return { seq: line.seq, next };
+  return null;
+}
+
+function walkLines(prev, drop, texts, nextSeq) {
+  let pi = drop;
+  let seq = nextSeq;
+  const lines = [];
+  for (let ti = 0; ti < texts.length; ti += 1) {
+    const consumed = tryConsume(prev, pi, texts[ti]);
+    if (consumed) {
+      lines.push({ text: texts[ti], seq: consumed.seq, partial: false });
+      pi = consumed.next;
+      continue;
+    }
+    if (pi < prev.length) return null;
+    lines.push({ text: texts[ti], seq, partial: false });
+    seq += 1;
+  }
+  if (pi !== prev.length) return null;
+  return { lines, nextSeq: seq };
+}
+
+function fallbackLines(prev, texts, nextSeq) {
+  const lines = [];
+  let seq = nextSeq;
+  for (let i = 0; i < texts.length; i += 1) {
+    if (i < prev.length) lines.push({ text: texts[i], seq: prev[i].seq, partial: false });
+    else {
+      lines.push({ text: texts[i], seq, partial: false });
+      seq += 1;
+    }
+  }
+  return { lines, nextSeq: seq };
+}
+
+function reusedCount(lines, prev) {
+  const known = new Set(prev.map(line => line.seq));
+  let count = 0;
+  for (const line of lines) if (known.has(line.seq)) count += 1;
+  return count;
+}
+
+function keepPartial(prevLines, texts) {
+  if (!prevLines.length || !texts.length) return false;
+  const last = prevLines[prevLines.length - 1];
+  if (!last?.partial) return false;
+  if (texts.length > prevLines.length) return false;
+  if (texts[texts.length - 1] !== last.text) return false;
+  const prevBody = prevLines.slice(0, -1).map(line => line.text);
+  const nextBody = texts.slice(0, -1);
+  const drop = prevBody.length - nextBody.length;
+  for (let i = 0; i < nextBody.length; i += 1) {
+    if (prevBody[drop + i] !== nextBody[i]) return false;
   }
   return true;
+}
+
+function syncMarks(run) {
+  const state = markFor(run.run_id);
+  const texts = Array.isArray(run.output_tail) ? run.output_tail.map(line => String(line)) : [];
+  if (!texts.length) return state;
+  const prev = state.lines;
+  const unchanged = prev.length === texts.length && prev.every((line, index) => line.text === texts[index]);
+  if (!unchanged) {
+    let chosen = null;
+    for (let drop = 0; drop <= prev.length; drop += 1) {
+      const walked = walkLines(prev, drop, texts, state.nextSeq);
+      if (!walked) continue;
+      if (prev.length && reusedCount(walked.lines, prev) === 0) continue;
+      chosen = walked;
+      break;
+    }
+    if (!chosen) chosen = prev.length ? fallbackLines(prev, texts, state.nextSeq) : walkLines(prev, 0, texts, state.nextSeq);
+    state.lines = chosen.lines;
+    state.nextSeq = chosen.nextSeq;
+  }
+  for (const line of state.lines) {
+    line.partial = false;
+    raiseHigh(state, line.seq);
+  }
+  if (run._openPartial && state.lines.length) state.lines[state.lines.length - 1].partial = true;
+  return state;
 }
 
 function phaseSuffix(taskRuns, status) {
@@ -488,19 +591,36 @@ function renderSidebar() {
   els.viewAll.title = showAllRuns ? 'Show latest runs' : 'Show all runs';
 }
 
+function phaseKind(phaseRun) {
+  if (!phaseRun) return 'pending';
+  if (phaseRun.status === 'started') return 'active';
+  if (phaseRun.status === 'completed') return 'done';
+  if (phaseRun.status === 'failed') return 'failed';
+  return 'unknown';
+}
+
+function connectorKind(from, to) {
+  if (to === 'pending' || to === 'unknown') return 'dash';
+  if (to === 'active') return 'active';
+  if (from === 'done' && to === 'done') return 'done';
+  if (to === 'failed') return 'failed';
+  return 'dash';
+}
+
 function renderTimeline() {
   const run = selectedRun();
   const taskRuns = run ? runs.filter(item => taskKey(item) === taskKey(run)) : [];
+  const kinds = [];
+  const items = [];
   for (const phase of PHASES) {
     const item = document.querySelector(`#timeline [data-phase="${phase.id}"]`);
     const button = item.querySelector('button');
     const duration = item.querySelector('.phase-duration');
     const status = item.querySelector('.phase-status');
     const phaseRun = latestForPhase(taskRuns, phase.id);
-    let kind = 'pending';
-    if (phaseRun?.status === 'started') kind = 'active';
-    else if (phaseRun?.status === 'completed') kind = 'done';
-    else if (phaseRun?.status === 'failed') kind = 'failed';
+    const kind = phaseKind(phaseRun);
+    kinds.push(kind);
+    items.push(item);
     item.className = `is-${kind}`;
     if (phaseRun && run && phaseRun.run_id === run.run_id) item.classList.add('is-current');
     button.disabled = !phaseRun;
@@ -523,6 +643,10 @@ function renderTimeline() {
       status.textContent = DASH;
       status.dataset.status = 'unknown';
     }
+  }
+  for (let i = 0; i < items.length; i += 1) {
+    if (i === items.length - 1) delete items[i].dataset.connect;
+    else items[i].dataset.connect = connectorKind(kinds[i], kinds[i + 1]);
   }
 }
 
@@ -592,47 +716,21 @@ function renderLogLine(entry) {
   return row;
 }
 
-function clearMark(run) {
-  const saved = cleared.get(run.run_id);
-  if (!saved) return null;
-  if (Array.isArray(saved)) return { lines: saved, partial: false };
-  if (!Array.isArray(saved.lines)) return null;
-  return { lines: saved.lines, partial: Boolean(saved.partial) };
-}
-
 function visibleEntries(run) {
   if (!run) return [];
+  const texts = Array.isArray(run.output_tail) ? run.output_tail : [];
+  if (!texts.length) return [];
+  const state = syncMarks(run);
   const entries = Array.isArray(run._meta) ? run._meta : [];
-  const mark = clearMark(run);
-  if (!mark || !mark.lines.length) return entries;
-  const texts = entries.map(entry => entry.text);
-  for (let offset = 0; offset <= mark.lines.length; offset += 1) {
-    const suffix = mark.lines.slice(offset);
-    if (suffix.length > texts.length) continue;
-    let remainder = '';
-    let ok = true;
-    for (let i = 0; ok && i < suffix.length; i += 1) {
-      const expected = suffix[i];
-      const current = texts[i];
-      if (current === expected) continue;
-      const boundary = mark.partial && i === suffix.length - 1;
-      if (boundary && typeof expected === 'string' && expected && typeof current === 'string' && current.startsWith(expected)) {
-        remainder = current.slice(expected.length);
-        continue;
-      }
-      ok = false;
-    }
-    if (!ok) continue;
-    const rest = entries.slice(suffix.length);
-    if (!remainder) return rest;
-    const source = entries[suffix.length - 1];
-    return [{
-      text: remainder,
-      time: source?.time || null,
-      tag: safeTag(source?.tag || 'INFO'),
-    }, ...rest];
+  const visible = [];
+  for (let i = 0; i < state.lines.length; i += 1) {
+    const line = state.lines[i];
+    if (line.seq <= state.cutoff) continue;
+    const entry = entries[i];
+    if (entry) visible.push(entry);
+    else visible.push({ text: line.text, time: null, tag: safeTag(tagFromText(line.text)) });
   }
-  return entries;
+  return visible;
 }
 
 function renderStream(run) {
@@ -776,8 +874,10 @@ function applySnapshot(body) {
     const old = previous.get(run.run_id);
     run._meta = realignMeta(old?._meta, run.output_tail);
     run._errors = Array.isArray(old?._errors) ? old._errors : [];
-    run._openPartial = Boolean(old?._openPartial && sameTail(old?.output_tail, run.output_tail));
+    const prior = outputMarks.get(run.run_id);
+    run._openPartial = Boolean(prior && keepPartial(prior.lines, run.output_tail));
     harvestErrors(run);
+    syncMarks(run);
   }
   runs = next;
   if (!runs.some(run => run.run_id === selectedRunId)) {
@@ -837,7 +937,9 @@ function applyStdout(run, data) {
     const chunk = typeof data.text === 'string' ? data.text : '';
     if (!chunk) return;
     const tag = tagFromEvent(data.line, chunk);
-    if (!run._openPartial || !run.output_tail.length) {
+    const lastMark = outputMarks.get(run.run_id)?.lines;
+    const open = Boolean(run._openPartial || (lastMark?.length && lastMark[lastMark.length - 1].partial));
+    if (!open || !run.output_tail.length) {
       run.output_tail.push(chunk);
       run._meta.push({ text: chunk, time, tag });
       run._openPartial = true;
@@ -846,6 +948,7 @@ function applyStdout(run, data) {
       run.output_tail[last] += chunk;
       if (run._meta[last]) run._meta[last].text += chunk;
       else run._meta[last] = { text: run.output_tail[last], time, tag };
+      run._openPartial = true;
     }
   } else {
     run._openPartial = false;
@@ -860,6 +963,7 @@ function applyStdout(run, data) {
     }
   }
   trimTail(run);
+  syncMarks(run);
 }
 
 function onStdout(data) {
@@ -944,11 +1048,8 @@ function onTimelineClick(event) {
 function onClear() {
   const run = selectedRun();
   if (!run) return;
-  const lines = Array.isArray(run.output_tail) ? run.output_tail.slice() : [];
-  cleared.set(run.run_id, { lines, partial: Boolean(run._openPartial) });
-  run.output_tail = [];
-  run._meta = [];
-  run._openPartial = false;
+  const state = syncMarks(run);
+  if (state.high > state.cutoff) state.cutoff = state.high;
   renderOutput();
 }
 
