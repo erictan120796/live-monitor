@@ -36,7 +36,20 @@ const els = {
   sessionMeta: document.getElementById('session-meta'),
 };
 
+const CURSOR_BUCKETS = [
+  ['today', 'today'],
+  ['last_7_days', 'last_7_days'],
+  ['this_month', 'this_month'],
+];
+const CURSOR_FIELDS = [
+  ['input', 'input_tokens'],
+  ['output', 'output_tokens'],
+  ['cached', 'cached_input_tokens'],
+  ['total', 'total_tokens'],
+];
+
 let runs = [];
+let cursorUsage = null;
 let selectedRunId = null;
 let outputRunId = null;
 let showAllRuns = false;
@@ -714,6 +727,18 @@ function renderSession(run) {
   els.sessionMeta.title = text;
 }
 
+function renderCursorUsage() {
+  const ready = Boolean(cursorUsage && typeof cursorUsage === 'object');
+  for (const [bucket] of CURSOR_BUCKETS) {
+    const row = document.querySelector(`#cursor-usage [data-bucket="${bucket}"]`);
+    const source = ready ? cursorUsage[bucket] : null;
+    for (const [field, key] of CURSOR_FIELDS) {
+      const cell = row.querySelector(`[data-field="${field}"]`);
+      cell.textContent = ready ? formatCount(source?.[key]) : DASH;
+    }
+  }
+}
+
 function renderTokens() {
   const run = selectedRun();
   const tokens = run?.tokens && typeof run.tokens === 'object' ? run.tokens : {};
@@ -734,6 +759,7 @@ function renderAll() {
   renderOutput();
   renderErrors();
   renderTokens();
+  renderCursorUsage();
 }
 
 function tick() {
@@ -780,6 +806,9 @@ function applySnapshot(body) {
     harvestErrors(run);
   }
   runs = next;
+  if (body && typeof body === 'object' && Object.prototype.hasOwnProperty.call(body, 'cursor_usage')) {
+    cursorUsage = body.cursor_usage;
+  }
   if (!runs.some(run => run.run_id === selectedRunId)) {
     const first = orderedTasks()[0];
     selectedRunId = first ? focusRun(first.runs)?.run_id ?? null : null;
@@ -906,6 +935,10 @@ function onStatus(data) {
 }
 
 function onEvent(type, event) {
+  if (type === 'cursor_usage') {
+    requestSnapshot();
+    return;
+  }
   let data = null;
   if (type !== 'heartbeat') {
     try {
@@ -924,6 +957,7 @@ function connect() {
   source.addEventListener('stdout', event => onEvent('stdout', event));
   source.addEventListener('status', event => onEvent('status', event));
   source.addEventListener('run', event => onEvent('run', event));
+  source.addEventListener('cursor_usage', event => onEvent('cursor_usage', event));
   source.addEventListener('heartbeat', event => onEvent('heartbeat', event));
   source.onopen = () => {
     setConnection('live');

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, appendFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, appendFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
 import path from 'node:path';
 import { discoverRuns, defaultRunsRoot } from '../src/discovery.mjs';
@@ -555,5 +555,282 @@ test('partial chunks get increasing seqs and the snapshot line seq advances', as
     });
   } finally {
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+function resultLine(usage, timestamp) {
+  return JSON.stringify({ type: 'result', subtype: 'success', timestamp, usage });
+}
+
+function toolLine(index) {
+  return JSON.stringify({
+    type: 'tool_call',
+    subtype: 'started',
+    call_id: `tool-${index}`,
+    tool_call: { readToolCall: { args: { path: `${index}.js` } } },
+  });
+}
+
+async function writeRun(runs, { id, agent = 'cursor', ended, status = 'completed', lines, phase = 'code' }) {
+  const dir = path.join(runs, id);
+  await mkdir(dir);
+  const stdout = path.join(dir, 'stdout.jsonl');
+  const statusPath = path.join(dir, 'status.jsonl');
+  const body = Array.isArray(lines) ? lines.join('\n') : String(lines);
+  await writeFile(stdout, body.endsWith('\n') ? body : `${body}\n`);
+  const stamp = ended || '2026-11-15T01:00:00.000Z';
+  await writeFile(statusPath, `${JSON.stringify({
+    v: 1, seq: 1, ts: stamp, run_id: id, phase, status,
+  })}\n`);
+  const manifest = {
+    schema_version: 1,
+    run_id: id,
+    agent,
+    phase,
+    requested_model: agent === 'codex' ? 'gpt-5' : 'grok-4.7-medium',
+    started_at: '2026-11-01T00:00:00.000Z',
+    files: { stdout, stderr: path.join(dir, 'stderr.log'), status: statusPath },
+  };
+  if (ended) manifest.ended_at = ended;
+  await writeFile(path.join(dir, 'manifest.json'), JSON.stringify(manifest));
+  return { dir, stdout, statusPath, manifestPath: path.join(dir, 'manifest.json') };
+}
+
+test('snapshot cursor_usage sums historical Cursor runs and ignores Codex', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'live-monitor-cursor-usage-'));
+  const runs = path.join(root, 'runs');
+  await mkdir(runs);
+  const now = Date.parse('2026-11-15T04:00:00.000Z');
+  try {
+    const early = [
+      'not json {',
+      resultLine({ inputTokens: 1000, outputTokens: 1000, cacheReadTokens: 1000, cacheWriteTokens: 1000 }, '2026-11-15T05:00:00.000Z'),
+      resultLine({ inputTokens: 4, outputTokens: 6, cacheReadTokens: 2, cacheWriteTokens: 70 }, '2026-11-15T05:00:00.000Z'),
+      ...Array.from({ length: 210 }, (_, index) => toolLine(index)),
+    ];
+    await writeRun(runs, {
+      id: 'today-main',
+      ended: '2026-11-15T01:00:00.000Z',
+      lines: [resultLine({ inputTokens: 100, outputTokens: 10, cacheReadTokens: 7, cacheWriteTokens: 500 }, '2026-11-15T01:00:00.000Z')],
+    });
+    await writeRun(runs, {
+      id: 'within-week',
+      ended: '2026-11-12T02:00:00.000Z',
+      lines: [resultLine({ inputTokens: 50, outputTokens: 5, cacheReadTokens: 1, cacheWriteTokens: 9 }, '2026-11-12T02:00:00.000Z')],
+    });
+    await writeRun(runs, {
+      id: 'month-boundary',
+      ended: '2026-10-31T16:30:00.000Z',
+      lines: [resultLine({ inputTokens: 3, outputTokens: 4 }, '2026-10-31T16:30:00.000Z')],
+    });
+    await writeRun(runs, {
+      id: 'failed-today',
+      status: 'failed',
+      ended: '2026-11-15T02:00:00.000Z',
+      lines: [resultLine({ inputTokens: 1, outputTokens: 1, cacheReadTokens: 0 }, '2026-11-15T02:00:00.000Z')],
+    });
+    await writeRun(runs, {
+      id: 'zero-today',
+      ended: '2026-11-15T03:00:00.000Z',
+      lines: [resultLine({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 }, '2026-11-15T03:00:00.000Z')],
+    });
+    await writeRun(runs, {
+      id: 'completed-empty',
+      ended: '2026-11-15T03:30:00.000Z',
+      lines: [JSON.stringify({ type: 'assistant', timestamp_ms: 1, model_call_id: 'c', message: { content: [{ type: 'text', text: 'done' }] } })],
+    });
+    await writeRun(runs, {
+      id: 'codex-huge',
+      agent: 'codex',
+      phase: 'design',
+      ended: '2026-11-15T01:30:00.000Z',
+      lines: [
+        JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 999999, output_tokens: 999999, total_tokens: 1999998 } }),
+        resultLine({ inputTokens: 888888, outputTokens: 1, cacheReadTokens: 1 }, '2026-11-15T01:30:00.000Z'),
+      ],
+    });
+    await writeRun(runs, {
+      id: 'buried-result',
+      ended: '2026-11-15T05:00:00.000Z',
+      lines: early,
+    });
+
+    await withServer({ runsRoot: runs, sessionsRoot: path.join(root, 'sessions'), now: () => now }, async monitor => {
+      const body = await snapshot(monitor);
+      const usage = body.cursor_usage;
+      assert.equal(usage.timezone, 'Asia/Kuala_Lumpur');
+      assert.equal(usage.today.run_count, 4);
+      assert.equal(usage.today.input_tokens, 105);
+      assert.equal(usage.today.output_tokens, 17);
+      assert.equal(usage.today.cached_input_tokens, 9);
+      assert.equal(usage.today.total_tokens, 122);
+      assert.equal(usage.last_7_days.run_count, 5);
+      assert.equal(usage.last_7_days.input_tokens, 155);
+      assert.equal(usage.last_7_days.output_tokens, 22);
+      assert.equal(usage.last_7_days.cached_input_tokens, 10);
+      assert.equal(usage.last_7_days.total_tokens, 177);
+      assert.equal(usage.this_month.run_count, 6);
+      assert.equal(usage.this_month.input_tokens, 158);
+      assert.equal(usage.this_month.output_tokens, 26);
+      assert.equal(usage.this_month.cached_input_tokens, null);
+      assert.equal(usage.this_month.total_tokens, 184);
+      const buried = body.runs.find(run => run.run_id === 'buried-result');
+      assert.equal(buried.output_tail.length, 200);
+      assert.equal(buried.output_tail.some(line => String(line).includes('inputTokens')), false);
+      assert.equal(buried.tokens.input_tokens, 4);
+      assert.equal(buried.tokens.total_tokens, 10);
+      const again = await snapshot(monitor);
+      assert.deepEqual(again.cursor_usage, usage);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test('cursor usage follows appends, completion, manifest rebucket, deletion, and midnight', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'live-monitor-cursor-live-'));
+  const runs = path.join(root, 'runs');
+  await mkdir(runs);
+  let now = Date.parse('2026-11-15T04:00:00.000Z');
+  try {
+    const live = await writeRun(runs, {
+      id: 'live-cursor',
+      status: 'started',
+      lines: [JSON.stringify({ type: 'assistant', timestamp_ms: 1, model_call_id: 'c1', message: { content: [{ type: 'text', text: 'working' }] } })],
+    });
+    await withServer({ runsRoot: runs, sessionsRoot: path.join(root, 'sessions'), now: () => now }, async monitor => {
+      const events = openEvents(monitor);
+      try {
+        const initial = await snapshot(monitor);
+        assert.equal(initial.cursor_usage.today.run_count, 0);
+        assert.equal(initial.cursor_usage.today.input_tokens, 0);
+        assert.equal(initial.cursor_usage.today.cached_input_tokens, 0);
+        const before = events.events.filter(item => item.event === 'cursor_usage').length;
+        await appendFile(live.stdout, `${resultLine({ inputTokens: 10, outputTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 40 }, '2026-11-15T01:00:00.000Z')}\n`);
+        const appended = await waitFor(async () => {
+          const body = await snapshot(monitor);
+          return body.cursor_usage.today.input_tokens === 10 ? body : null;
+        });
+        assert.ok(appended);
+        assert.equal(appended.cursor_usage.today.run_count, 1);
+        assert.equal(appended.cursor_usage.today.output_tokens, 2);
+        assert.equal(appended.cursor_usage.today.cached_input_tokens, 3);
+        assert.equal(appended.cursor_usage.today.total_tokens, 12);
+        assert.equal(appended.runs.find(run => run.run_id === 'live-cursor').tokens.input_tokens, 10);
+        const noted = await waitFor(() => {
+          const found = events.events.filter(item => item.event === 'cursor_usage');
+          return found.length > before ? found : null;
+        });
+        assert.ok(noted);
+        const stdoutEvent = events.events.find(item => item.event === 'stdout' && item.data.run_id === 'live-cursor' && String(item.data.line).includes('inputTokens'));
+        assert.ok(stdoutEvent);
+        assert.equal(stdoutEvent.data.run_id, 'live-cursor');
+        assert.equal(Object.hasOwn(stdoutEvent.data, 'seq'), true);
+        assert.equal(Object.hasOwn(stdoutEvent.data, 'text'), true);
+
+        await appendFile(live.stdout, `${resultLine({ inputTokens: 10, outputTokens: 2, cacheReadTokens: 3 }, '2026-11-15T01:00:00.000Z')}\n`);
+        await snapshot(monitor);
+        const replayed = await snapshot(monitor);
+        assert.equal(replayed.cursor_usage.today.run_count, 1);
+        assert.equal(replayed.cursor_usage.today.input_tokens, 10);
+        assert.equal(replayed.cursor_usage.today.total_tokens, 12);
+
+        const replacedBefore = events.events.filter(item => item.event === 'cursor_usage').length;
+        await appendFile(live.stdout, `${resultLine({ inputTokens: 4, outputTokens: 1, cacheReadTokens: 0 }, '2026-11-15T01:00:00.000Z')}\n`);
+        const replaced = await waitFor(async () => {
+          const body = await snapshot(monitor);
+          return body.cursor_usage.today.input_tokens === 4 ? body : null;
+        });
+        assert.equal(replaced.cursor_usage.today.run_count, 1);
+        assert.equal(replaced.cursor_usage.today.output_tokens, 1);
+        assert.equal(replaced.cursor_usage.today.cached_input_tokens, 0);
+        assert.equal(replaced.cursor_usage.today.total_tokens, 5);
+        assert.ok(await waitFor(() => events.events.filter(item => item.event === 'cursor_usage').length > replacedBefore));
+
+        const statusBefore = events.events.filter(item => item.event === 'cursor_usage').length;
+        await appendFile(live.statusPath, `${JSON.stringify({
+          v: 1, seq: 2, ts: '2026-09-01T04:00:00.000Z', run_id: 'live-cursor', phase: 'code', status: 'completed',
+        })}\n`);
+        const shifted = await waitFor(async () => {
+          const body = await snapshot(monitor);
+          return body.cursor_usage.today.run_count === 0 && body.cursor_usage.this_month.run_count === 0 ? body : null;
+        });
+        assert.ok(shifted);
+        assert.equal(shifted.runs.find(run => run.run_id === 'live-cursor').timings.ended_at, '2026-09-01T04:00:00.000Z');
+        const statusEvent = events.events.find(item => item.event === 'status' && item.data.run_id === 'live-cursor' && item.data.status === 'completed');
+        assert.equal(statusEvent.data.status, 'completed');
+        assert.ok(await waitFor(() => events.events.filter(item => item.event === 'cursor_usage').length > statusBefore));
+
+        const manifestBefore = events.events.filter(item => item.event === 'cursor_usage').length;
+        const manifest = JSON.parse(await readFile(live.manifestPath, 'utf8'));
+        manifest.ended_at = '2026-11-15T06:00:00.000Z';
+        await writeFile(live.manifestPath, JSON.stringify(manifest));
+        const restored = await waitFor(async () => {
+          const body = await snapshot(monitor);
+          return body.cursor_usage.today.input_tokens === 4 ? body : null;
+        });
+        assert.equal(restored.cursor_usage.today.run_count, 1);
+        assert.equal(restored.cursor_usage.this_month.total_tokens, 5);
+        assert.ok(await waitFor(() => events.events.filter(item => item.event === 'cursor_usage').length > manifestBefore));
+
+        await rm(live.dir, { recursive: true, force: true });
+        const removed = await waitFor(async () => {
+          const body = await snapshot(monitor);
+          return body.cursor_usage.today.run_count === 0 ? body : null;
+        });
+        assert.equal(removed.cursor_usage.last_7_days.run_count, 0);
+        assert.equal(removed.cursor_usage.this_month.cached_input_tokens, 0);
+      } finally {
+        await events.stop();
+      }
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+
+  const clockRoot = await mkdtemp(path.join(tmpdir(), 'live-monitor-cursor-clock-'));
+  const clockRuns = path.join(clockRoot, 'runs');
+  await mkdir(clockRuns);
+  let clock = Date.parse('2026-10-31T15:30:00.000Z');
+  try {
+    await writeRun(clockRuns, {
+      id: 'edge',
+      ended: '2026-10-31T15:00:00.000Z',
+      lines: [resultLine({ inputTokens: 6, outputTokens: 1, cacheReadTokens: 1 }, '2026-08-01T00:00:00.000Z')],
+    });
+    await withServer({ runsRoot: clockRuns, sessionsRoot: path.join(clockRoot, 'sessions'), now: () => clock }, async monitor => {
+      const events = openEvents(monitor);
+      try {
+        const beforeRoll = await snapshot(monitor);
+        assert.equal(beforeRoll.cursor_usage.today.input_tokens, 6);
+        assert.equal(beforeRoll.cursor_usage.this_month.input_tokens, 6);
+        const mark = events.events.filter(item => item.event === 'cursor_usage').length;
+        clock = Date.parse('2026-10-31T16:00:00.000Z');
+        const rolled = await waitFor(async () => {
+          const body = await snapshot(monitor);
+          return body.cursor_usage.today.run_count === 0 ? body : null;
+        });
+        assert.equal(rolled.cursor_usage.last_7_days.input_tokens, 6);
+        assert.equal(rolled.cursor_usage.this_month.run_count, 0);
+        assert.ok(await waitFor(() => events.events.filter(item => item.event === 'cursor_usage').length > mark));
+        clock = Date.parse('2026-10-31T16:30:00.000Z');
+        await writeRun(clockRuns, {
+          id: 'on-midnight',
+          ended: '2026-10-31T16:00:00.000Z',
+          lines: [resultLine({ inputTokens: 2, outputTokens: 2, cacheReadTokens: 0 }, '2026-08-01T00:00:00.000Z')],
+        });
+        const boundary = await waitFor(async () => {
+          const body = await snapshot(monitor);
+          return body.cursor_usage.today.input_tokens === 2 ? body : null;
+        });
+        assert.equal(boundary.cursor_usage.today.run_count, 1);
+        assert.equal(boundary.cursor_usage.this_month.total_tokens, 4);
+        assert.equal(boundary.cursor_usage.last_7_days.run_count, 2);
+      } finally {
+        await events.stop();
+      }
+    });
+  } finally {
+    await rm(clockRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });

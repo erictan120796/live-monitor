@@ -8,9 +8,11 @@ import { createTailer } from './tailer.mjs';
 import { parseCodexLine } from './parsers/codex.mjs';
 import { parseCursorLine } from './parsers/cursor.mjs';
 import {
+  aggregateCursorUsage,
   applyCursorResult,
   applySessionTokenCount,
   applyTurnCompleted,
+  createCursorUsageCache,
   createTokenState,
   cursorResultFromLine,
   defaultSessionsRoot,
@@ -261,11 +263,36 @@ function writeSse(res, event, data) {
 }
 
 function snapshotBody(ctx) {
-  const now = Date.now();
+  const now = ctx.now();
   const runs = [...ctx.runs.values()]
     .map(state => viewRun(state, now))
     .sort((a, b) => String(b.timings.started_at).localeCompare(String(a.timings.started_at)) || String(a.run_id).localeCompare(String(b.run_id)));
-  return { runs_root: ctx.runsRoot, generated_at: new Date(now).toISOString(), runs };
+  return {
+    runs_root: ctx.runsRoot,
+    generated_at: new Date(now).toISOString(),
+    runs,
+    cursor_usage: ctx.cursorUsage,
+  };
+}
+
+async function syncCursorUsage(ctx, found) {
+  const sources = [];
+  for (const entry of found || []) {
+    if (entry.manifest?.agent !== 'cursor') continue;
+    const state = ctx.runs.get(entry.manifest.run_id);
+    sources.push({
+      dir: entry.dir,
+      stdoutPath: state?.stdoutPath || entry.manifest.files?.stdout || path.join(entry.dir, 'stdout.jsonl'),
+      endedAt: state?.ended_at ?? entry.manifest.ended_at ?? null,
+    });
+  }
+  await ctx.cursorCache.reconcile(sources);
+  const aggregate = ctx.cursorCache.aggregate(ctx.now());
+  const sig = JSON.stringify(aggregate);
+  const changed = ctx.cursorSig !== undefined && sig !== ctx.cursorSig;
+  ctx.cursorUsage = aggregate;
+  ctx.cursorSig = sig;
+  if (changed && !ctx.closed) broadcast(ctx, 'cursor_usage', { ts: new Date(ctx.now()).toISOString() });
 }
 
 function resolveStatic(publicDir, urlPath) {
@@ -409,17 +436,32 @@ async function upsert(ctx, found) {
   }
 }
 
-async function refresh(ctx) {
+async function refresh(ctx, { pump = false } = {}) {
+  if (pump) ctx.pumpQueued = true;
   if (ctx.refreshing) {
     ctx.refreshQueued = true;
-    return ctx.refreshing;
+    const pending = ctx.refreshing;
+    await pending;
+    if (!ctx.closed && !ctx.refreshing && (ctx.refreshQueued || ctx.pumpQueued)) return refresh(ctx);
+    return;
   }
   ctx.refreshing = (async () => {
     do {
+      const pumpNow = ctx.pumpQueued;
       ctx.refreshQueued = false;
+      ctx.pumpQueued = false;
       const found = await discoverRuns(ctx.runsRoot);
+      ctx.found = found;
       for (const entry of found) await upsert(ctx, entry);
-    } while (ctx.refreshQueued && !ctx.closed);
+      if (pumpNow) {
+        for (const state of ctx.runs.values()) {
+          await state.stdoutTail?.pump();
+          await state.statusTail?.pump();
+          await state.sessionTail?.pump();
+        }
+      }
+      await syncCursorUsage(ctx, found);
+    } while ((ctx.refreshQueued || ctx.pumpQueued) && !ctx.closed);
   })().finally(() => {
     ctx.refreshing = null;
   });
@@ -451,12 +493,7 @@ async function route(ctx, req, res) {
   }
   const url = new URL(req.url || '/', `http://${HOST}`);
   if (url.pathname === '/api/snapshot') {
-    await refresh(ctx);
-    for (const state of ctx.runs.values()) {
-      await state.stdoutTail?.pump();
-      await state.statusTail?.pump();
-      await state.sessionTail?.pump();
-    }
+    await refresh(ctx, { pump: true });
     writeJson(res, 200, snapshotBody(ctx));
     return;
   }
@@ -493,18 +530,25 @@ export function startMonitor({
   port,
   pollMs = 500,
   heartbeatMs = 15000,
+  now = () => Date.now(),
 } = {}) {
   const ctx = {
     runsRoot,
     sessionsRoot,
     publicDir,
     pollMs,
+    now,
     closed: false,
     runs: new Map(),
     clients: new Set(),
     sessionIndex: new Map(),
     refreshing: null,
     refreshQueued: false,
+    pumpQueued: false,
+    found: [],
+    cursorCache: createCursorUsageCache(),
+    cursorUsage: aggregateCursorUsage([], now()),
+    cursorSig: undefined,
     dirWatch: null,
     pollTimer: null,
     heartTimer: null,

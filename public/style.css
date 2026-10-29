@@ -131,7 +131,15 @@ h1 {
   padding: 16px;
 }
 
-#token-panel { overflow: auto; }
+#token-panel {
+  overflow: auto;
+  padding: 12px;
+}
+
+#token-panel .card-title { margin-bottom: 8px; }
+#token-panel .metric { margin-bottom: 8px; }
+#token-panel .limit { margin-bottom: 8px; }
+#token-panel .limit-reset { margin-top: 2px; font-size: 12px; }
 
 #main-column {
   min-width: 0;
@@ -658,9 +666,79 @@ h1 {
   font-size: 14px;
 }
 
+#cursor-usage,
+#token-panel[data-state="empty"] #cursor-usage,
+#token-panel[data-state="unavailable"] #cursor-usage,
+#token-panel[data-state="available"] #cursor-usage {
+  display: block;
+  flex: none;
+  margin-top: 2px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  line-height: 1.3;
+}
+
+.cursor-usage-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.cursor-usage-head h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.cursor-usage-tz {
+  color: var(--faint);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.cursor-usage-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.cursor-usage-table th,
+.cursor-usage-table td {
+  padding: 1px 3px;
+  text-align: right;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.cursor-usage-table th[scope="row"] {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 650;
+}
+
+.cursor-usage-table thead th {
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+#cursor-dashboard {
+  display: inline-block;
+  margin-top: 4px;
+  color: #93c5fd;
+  font-size: 12px;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+#cursor-dashboard:hover { text-decoration: underline; }
+
 #session-meta {
   margin-top: auto;
-  padding-top: 10px;
+  padding-top: 6px;
   border-top: 1px solid var(--line);
   color: var(--faint);
   font-family: var(--mono);
@@ -694,4 +772,5 @@ h1 {
   #phase-list li:nth-child(2)::after,
   #phase-list li:nth-child(4)::after { display: none; }
   #output-panel { min-height: 360px; }
+  #cursor-usage { font-size: 12px; }
 }
