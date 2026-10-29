@@ -323,6 +323,26 @@ test('cursor usage scans the last valid result and sums overlapping MYT buckets'
   assert.equal(withUnknown.today.total_tokens, 16);
 });
 
+test('non-ISO result timestamp "1" buckets cursor usage by timestamp_ms', () => {
+  const stamp = Date.parse('2026-11-01T03:00:00.000Z');
+  const scanned = scanCursorStdout(cursorResult(
+    { inputTokens: 4, outputTokens: 1, cacheReadTokens: 2 },
+    { timestamp: '1', timestamp_ms: stamp },
+  ));
+  assert.equal(scanned.record.time, stamp);
+  const now = Date.parse('2026-11-01T04:00:00.000Z');
+  const totals = aggregateCursorUsage([{
+    input_tokens: scanned.record.usage.input_tokens,
+    output_tokens: scanned.record.usage.output_tokens,
+    cached_input_tokens: scanned.record.usage.cached_input_tokens,
+    total_tokens: scanned.record.usage.total_tokens,
+    at: scanned.record.time,
+  }], now);
+  assert.equal(totals.today.run_count, 1);
+  assert.equal(totals.today.input_tokens, 4);
+  assert.equal(totals.this_month.run_count, 1);
+});
+
 test('MYT day, month, and seven-day edges include midnight and drop the previous instant', () => {
   const beforeMidnight = Date.parse('2026-10-31T15:59:59.999Z');
   const midnight = Date.parse('2026-10-31T16:00:00.000Z');

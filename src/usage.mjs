@@ -233,7 +233,7 @@ export function parseUsageStamp(value) {
 
 function resultEventTime(event) {
   if (!event || typeof event !== 'object') return null;
-  if (typeof event.timestamp === 'string') {
+  if (typeof event.timestamp === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(event.timestamp)) {
     const ms = Date.parse(event.timestamp);
     if (Number.isFinite(ms)) return ms;
   }
