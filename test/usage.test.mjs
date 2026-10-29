@@ -100,7 +100,7 @@ test('cumulative codex snapshots replace and cursor tokens stay unavailable', ()
   assert.equal(unavailable.reason, 'unavailable');
   assert.equal(unavailable.input_tokens, null);
   assert.equal(unavailable.total_tokens, null);
-  assert.equal(unavailable.rate_limits.primary.used_percent, null);
+  assert.equal(unavailable.rate_limits, null);
 
   const limitsOnly = tokenCountFromLine(line('event_msg', {
     type: 'token_count',
@@ -154,8 +154,7 @@ test('cursor result usage maps into run tokens and stays absent without it', () 
   assert.equal(view.cache_write_input_tokens, 15);
   assert.equal(view.reasoning_output_tokens, null);
   assert.equal(view.total_tokens, 1540);
-  assert.equal(view.rate_limits.primary.used_percent, null);
-  assert.equal(view.rate_limits.secondary.used_percent, null);
+  assert.equal(view.rate_limits, null);
 
   const absent = createTokenState('cursor');
   applyCursorResult(absent, cursorResultFromLine(JSON.stringify({ type: 'result' })));
@@ -169,8 +168,7 @@ test('cursor result usage maps into run tokens and stays absent without it', () 
   assert.equal(empty.cached_input_tokens, null);
   assert.equal(empty.cache_write_input_tokens, null);
   assert.equal(empty.total_tokens, null);
-  assert.equal(empty.rate_limits.primary.used_percent, null);
-  assert.equal(empty.rate_limits.secondary.used_percent, null);
+  assert.equal(empty.rate_limits, null);
 
   const codex = createTokenState('codex');
   applyTurnCompleted(codex, { input_tokens: 11, cached_input_tokens: 2, output_tokens: 3, cache_write_input_tokens: 4 });

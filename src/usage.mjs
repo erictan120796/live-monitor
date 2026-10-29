@@ -116,7 +116,7 @@ export function projectTokens(state) {
     output_tokens: null,
     reasoning_output_tokens: null,
     total_tokens: null,
-    rate_limits: emptyRateLimits(),
+    rate_limits: state.agent === 'cursor' ? null : emptyRateLimits(),
   };
   if (state.agent === 'cursor') {
     if (!state.counts) return blank;
@@ -134,7 +134,7 @@ export function projectTokens(state) {
     output_tokens: counts?.output_tokens ?? null,
     reasoning_output_tokens: counts?.reasoning_output_tokens ?? null,
     total_tokens: counts?.total_tokens ?? null,
-    rate_limits: {
+    rate_limits: state.agent === 'cursor' ? null : {
       primary: { used_percent: state.rate_limits.primary.used_percent },
       secondary: { used_percent: state.rate_limits.secondary.used_percent },
     },
