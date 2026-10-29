@@ -8,9 +8,11 @@ import { createTailer } from './tailer.mjs';
 import { parseCodexLine } from './parsers/codex.mjs';
 import { parseCursorLine } from './parsers/cursor.mjs';
 import {
+  applyCursorResult,
   applySessionTokenCount,
   applyTurnCompleted,
   createTokenState,
+  cursorResultFromLine,
   defaultSessionsRoot,
   findSessionFile,
   projectTokens,
@@ -327,6 +329,9 @@ function onStdout(ctx, state, line) {
     if (parsed.model) state.reported_model = parsed.model;
   }
   if (parsed?.kind === 'turn.completed') applyTurnCompleted(state.tokens, parsed.usage);
+  if (state.agent === 'cursor' && parsed?.kind === 'result') {
+    applyCursorResult(state.tokens, cursorResultFromLine(line));
+  }
   const produced = applyOutput(state, parsed, line);
   broadcast(ctx, 'stdout', { run_id: state.run_id, line, text: produced.text, seq: produced.seq });
 }

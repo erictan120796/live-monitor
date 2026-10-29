@@ -68,6 +68,30 @@ export function applyTurnCompleted(state, usage) {
   return state;
 }
 
+export function cursorResultFromLine(line) {
+  let event;
+  try {
+    event = JSON.parse(String(line).replace(/^\uFEFF/, ''));
+  } catch {
+    return null;
+  }
+  if (!event || typeof event !== 'object' || event.type !== 'result') return null;
+  const usage = event.usage;
+  if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return null;
+  return usage;
+}
+
+export function applyCursorResult(state, usage) {
+  if (state.agent !== 'cursor' || !usage || typeof usage !== 'object') return state;
+  writeCounts(state, {
+    input_tokens: usage.inputTokens,
+    output_tokens: usage.outputTokens,
+    cached_input_tokens: usage.cacheReadTokens,
+    cache_write_input_tokens: usage.cacheWriteTokens,
+  }, 'cursor_result');
+  return state;
+}
+
 export function applySessionTokenCount(state, snapshot) {
   if (state.agent !== 'codex' || !snapshot) return state;
   writeCounts(state, snapshot.usage, 'session');
@@ -94,7 +118,11 @@ export function projectTokens(state) {
     total_tokens: null,
     rate_limits: emptyRateLimits(),
   };
-  if (state.agent !== 'codex') return blank;
+  if (state.agent === 'cursor') {
+    if (!state.counts) return blank;
+  } else if (state.agent !== 'codex') {
+    return blank;
+  }
   const counts = state.counts;
   return {
     available: true,

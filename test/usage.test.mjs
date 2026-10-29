@@ -4,9 +4,11 @@ import { mkdtemp, mkdir, writeFile, utimes, rm } from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
 import path from 'node:path';
 import {
+  applyCursorResult,
   applySessionTokenCount,
   applyTurnCompleted,
   createTokenState,
+  cursorResultFromLine,
   defaultSessionsRoot,
   findSessionFile,
   projectTokens,
@@ -124,6 +126,63 @@ test('cumulative codex snapshots replace and cursor tokens stay unavailable', ()
   assert.equal(view.rate_limits.primary.used_percent, 15);
   assert.equal(view.rate_limits.secondary.used_percent, 3);
   assert.equal(tokenCountFromLine(line('event_msg', { type: 'token_count', info: {} }).trim()), null);
+});
+
+test('cursor result usage maps into run tokens and stays absent without it', () => {
+  const usage = {
+    inputTokens: 1200,
+    outputTokens: 340,
+    cacheReadTokens: 80,
+    cacheWriteTokens: 15,
+  };
+  const line = JSON.stringify({ type: 'result', subtype: 'success', usage });
+  const parsed = cursorResultFromLine(line);
+  assert.deepEqual(parsed, usage);
+  assert.equal(cursorResultFromLine(JSON.stringify({ type: 'result', subtype: 'success' })), null);
+  assert.equal(cursorResultFromLine(JSON.stringify({ type: 'result', usage: null })), null);
+  assert.equal(cursorResultFromLine(JSON.stringify({ status: 'finished' })), null);
+
+  const cursor = createTokenState('cursor');
+  applyCursorResult(cursor, parsed);
+  const view = projectTokens(cursor);
+  assert.equal(view.available, true);
+  assert.equal(view.reason, null);
+  assert.equal(view.source, 'cursor_result');
+  assert.equal(view.input_tokens, 1200);
+  assert.equal(view.output_tokens, 340);
+  assert.equal(view.cached_input_tokens, 80);
+  assert.equal(view.cache_write_input_tokens, 15);
+  assert.equal(view.reasoning_output_tokens, null);
+  assert.equal(view.total_tokens, 1540);
+  assert.equal(view.rate_limits.primary.used_percent, null);
+  assert.equal(view.rate_limits.secondary.used_percent, null);
+
+  const absent = createTokenState('cursor');
+  applyCursorResult(absent, cursorResultFromLine(JSON.stringify({ type: 'result' })));
+  applyCursorResult(absent, {});
+  const empty = projectTokens(absent);
+  assert.equal(empty.available, false);
+  assert.equal(empty.reason, 'unavailable');
+  assert.equal(empty.source, null);
+  assert.equal(empty.input_tokens, null);
+  assert.equal(empty.output_tokens, null);
+  assert.equal(empty.cached_input_tokens, null);
+  assert.equal(empty.cache_write_input_tokens, null);
+  assert.equal(empty.total_tokens, null);
+  assert.equal(empty.rate_limits.primary.used_percent, null);
+  assert.equal(empty.rate_limits.secondary.used_percent, null);
+
+  const codex = createTokenState('codex');
+  applyTurnCompleted(codex, { input_tokens: 11, cached_input_tokens: 2, output_tokens: 3, cache_write_input_tokens: 4 });
+  applyCursorResult(codex, usage);
+  const codexView = projectTokens(codex);
+  assert.equal(codexView.available, true);
+  assert.equal(codexView.source, 'turn.completed');
+  assert.equal(codexView.input_tokens, 11);
+  assert.equal(codexView.cached_input_tokens, 2);
+  assert.equal(codexView.cache_write_input_tokens, 4);
+  assert.equal(codexView.output_tokens, 3);
+  assert.equal(codexView.total_tokens, 14);
 });
 
 test('session token_count matches thread_id and ignores a newer file', async () => {
