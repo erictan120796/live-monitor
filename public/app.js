@@ -418,7 +418,7 @@ const outputMarks = new Map();
 function markFor(runId) {
   let state = outputMarks.get(runId);
   if (!state) {
-    state = { cutoff: 0, high: 0, nextSeq: 1, lines: [] };
+    state = { cutoff: 0, high: 0, nextSeq: 1, lines: [], origin: 0, stream: '', received: 0, spans: [] };
     outputMarks.set(runId, state);
   }
   return state;
@@ -498,10 +498,73 @@ function keepPartial(prevLines, texts) {
   return true;
 }
 
+function contentOf(raw) {
+  return String(raw).replace(/\r\n|\n|\r/g, '');
+}
+
+function textAfter(raw, skip) {
+  if (skip <= 0) return String(raw);
+  const text = String(raw);
+  let seen = 0;
+  let i = 0;
+  while (i < text.length) {
+    const code = text.charCodeAt(i);
+    if (code === 10) {
+      i += 1;
+      continue;
+    }
+    if (code === 13) {
+      i += text.charCodeAt(i + 1) === 10 ? 2 : 1;
+      continue;
+    }
+    seen += 1;
+    i += 1;
+    if (seen >= skip) return text.slice(i);
+  }
+  return '';
+}
+
+// Cutoff is a cumulative content-char offset. Line breaks are not counted, so
+// a snapshot that re-splits the same characters keeps those offsets.
+function placeContent(state, content) {
+  const prev = state.stream;
+  const origin = state.origin;
+  if (!content) return origin + prev.length;
+  let start = origin;
+  if (!prev || content.startsWith(prev)) {
+    start = origin;
+  } else if (prev.includes(content)) {
+    start = origin + prev.lastIndexOf(content);
+  } else {
+    const at = content.indexOf(prev);
+    if (at >= 0 && origin >= at) {
+      start = origin - at;
+    } else {
+      let overlap = 0;
+      const max = Math.min(prev.length, content.length);
+      for (let n = max; n > 0; n -= 1) {
+        if (prev.slice(prev.length - n) === content.slice(0, n)) {
+          overlap = n;
+          break;
+        }
+      }
+      start = overlap > 0 ? origin + prev.length - overlap : origin + prev.length;
+    }
+  }
+  state.origin = start;
+  state.stream = content;
+  const end = start + content.length;
+  if (end > state.received) state.received = end;
+  return start;
+}
+
 function syncMarks(run) {
   const state = markFor(run.run_id);
   const texts = Array.isArray(run.output_tail) ? run.output_tail.map(line => String(line)) : [];
-  if (!texts.length) return state;
+  if (!texts.length) {
+    state.spans = [];
+    return state;
+  }
   const prev = state.lines;
   const unchanged = prev.length === texts.length && prev.every((line, index) => line.text === texts[index]);
   if (!unchanged) {
@@ -522,6 +585,20 @@ function syncMarks(run) {
     raiseHigh(state, line.seq);
   }
   if (run._openPartial && state.lines.length) state.lines[state.lines.length - 1].partial = true;
+  const pieces = texts.map(contentOf);
+  let cursor = 0;
+  const ranges = [];
+  for (let i = 0; i < texts.length; i += 1) {
+    const start = cursor;
+    cursor += pieces[i].length;
+    ranges.push({ text: texts[i], start, end: cursor });
+  }
+  const base = placeContent(state, pieces.join(''));
+  state.spans = ranges.map(range => ({
+    text: range.text,
+    start: base + range.start,
+    end: base + range.end,
+  }));
   return state;
 }
 
@@ -723,12 +800,16 @@ function visibleEntries(run) {
   const state = syncMarks(run);
   const entries = Array.isArray(run._meta) ? run._meta : [];
   const visible = [];
-  for (let i = 0; i < state.lines.length; i += 1) {
-    const line = state.lines[i];
-    if (line.seq <= state.cutoff) continue;
+  for (let i = 0; i < state.spans.length; i += 1) {
+    const span = state.spans[i];
+    if (span.end <= state.cutoff) continue;
     const entry = entries[i];
-    if (entry) visible.push(entry);
-    else visible.push({ text: line.text, time: null, tag: safeTag(tagFromText(line.text)) });
+    const source = entry ? entry.text : span.text;
+    const shown = span.start >= state.cutoff ? source : textAfter(source, state.cutoff - span.start);
+    if (!shown) continue;
+    if (entry && shown === entry.text) visible.push(entry);
+    else if (entry) visible.push({ text: shown, time: entry.time || null, tag: entry.tag });
+    else visible.push({ text: shown, time: null, tag: safeTag(tagFromText(span.text)) });
   }
   return visible;
 }
@@ -1049,7 +1130,7 @@ function onClear() {
   const run = selectedRun();
   if (!run) return;
   const state = syncMarks(run);
-  if (state.high > state.cutoff) state.cutoff = state.high;
+  if (state.received > state.cutoff) state.cutoff = state.received;
   renderOutput();
 }
 
