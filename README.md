@@ -93,8 +93,13 @@ creates one folder. Related design, code, review, and fix runs share one
 ```
 
 Version checks may add `version.stdout.log`, `version.stderr.log`, and
-`version-launch.json`. `.ps1` launches may add `launch.json`. Cursor `-OutFile`
-captures stay at the given path, outside the run folder, with stderr at
+`version-launch.json`. `.ps1` launches may add `launch.json`. The Codex
+manifest records the run's own session file as `session_file`: matched by
+`thread_id` against the session's `session_meta` identity under the Codex
+sessions root, never by picking the newest file. Overlapping Codex runs
+therefore cannot report another run's session or tokens — take the session
+file/ID from the run folder instead of latest-session auto-detect. Cursor
+`-OutFile` captures stay at the given path, outside the run folder, with stderr at
 `<OutFile>.err`.
 
 `crun.ps1 -OutFile` remains supported: stdout uses that exact absolute-resolved
@@ -108,7 +113,7 @@ silently overwritten. Without `OutFile`, every capture is inside its run folder.
 | Setting | Value |
 | --- | --- |
 | Runs root | `C:\Users\User\.orchestrator\runs` (`$HOME\.orchestrator\runs`) |
-| Override | `LIVE_MONITOR_RUNS`, or wrapper `-RunsRoot` |
+| Override | `LIVE_MONITOR_RUNS`, or wrapper `-RunsRoot` (runs root); `LIVE_MONITOR_SESSIONS`, or wrapper `-SessionsRoot` on `codexrun.ps1` (Codex sessions root) |
 | Codex sessions root | `C:\Users\User\.codex\sessions` (`$HOME\.codex\sessions`) |
 | Monitor address | `127.0.0.1:5180` (`PORT` overrides the port) |
 | Log retention policy | 30 days; optional manual `wrappers/prune-runs.ps1`; wrappers never delete |

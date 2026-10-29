@@ -173,14 +173,49 @@ function Update-AgentMetadata {
     }
 }
 
+function Resolve-RunSessionFile {
+    # Identity match against the session's session_meta event, never recency:
+    # overlapping Codex runs must not inherit another run's session or tokens.
+    # Newest-name-first search order is only a bounded-effort optimization; a
+    # file becomes the result only when its session identity equals the run's
+    # thread_id. Best-effort: unreadable, malformed or non-session files skip.
+    param([string]$SessionsRoot, [string]$ThreadId, [int]$Limit = 500)
+    if (-not $SessionsRoot -or -not $ThreadId) { return $null }
+    if (-not [IO.Directory]::Exists($SessionsRoot)) { return $null }
+    $candidates = @(Get-ChildItem -LiteralPath $SessionsRoot -Filter '*.jsonl' -File -Recurse -ErrorAction SilentlyContinue |
+        Sort-Object -Property FullName -Descending | Select-Object -First $Limit)
+    foreach ($file in $candidates) {
+        try {
+            $stream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            try {
+                $reader = New-Object IO.StreamReader($stream, [Text.Encoding]::UTF8)
+                $first = $reader.ReadLine()
+                $reader.Dispose()
+            } finally { $stream.Dispose() }
+            if (-not $first) { continue }
+            $first = $first.TrimStart([char]0xFEFF)
+            if ($first -notmatch '"session_meta"') { continue }
+            $event = $first | ConvertFrom-Json -ErrorAction Stop
+            $payload = $event.payload
+            if (-not ($payload -is [pscustomobject])) { continue }
+            $identity = $payload.id
+            if (-not $identity) { $identity = $payload.thread_id }
+            if (-not $identity) { $identity = $payload.session_id }
+            if ($identity -and [string]$identity -eq $ThreadId) { return $file.FullName }
+        } catch { continue }
+    }
+    return $null
+}
+
 function Invoke-AgentRun {
     [CmdletBinding()]
     param([string]$Agent, [string]$PromptFile, [string]$Phase, [string]$TaskId, [int]$Attempt,
           [string]$Model, [string]$Effort, [string]$WorkDir, [string]$OutFile,
-          [double]$TimeoutMin, [string]$RunsRoot, [string]$Executable)
+          [double]$TimeoutMin, [string]$RunsRoot, [string]$SessionsRoot, [string]$Executable)
     $ErrorActionPreference = 'Stop'
     if (-not $RunsRoot) { $RunsRoot = Join-Path $HOME '.orchestrator\runs' }
     $RunsRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RunsRoot)
+    if (-not $SessionsRoot) { $SessionsRoot = Join-Path $HOME '.codex\sessions' }
     [void][IO.Directory]::CreateDirectory($RunsRoot)
     $runId = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ') + '-' + [guid]::NewGuid().ToString('N')
     $runDir = Join-Path $RunsRoot $runId
@@ -202,7 +237,7 @@ function Invoke-AgentRun {
         files = @{ stdout = $stdout; stderr = $stderr; status = $status }
         task_id = $(if ($TaskId) { $TaskId } else { $null }); attempt = $Attempt
         executable = $Executable; transport = $null; launch_executable = $null; launch_entry_script = $null
-        cli_version = $null; thread_id = $null; session_id = $null
+        cli_version = $null; thread_id = $null; session_id = $null; session_file = $null
         reported_model = $null; ended_at = $null; exit_code = $null
         native_failure = $false; cleanup_scope = 'launched_process_only'
     }
@@ -334,6 +369,12 @@ function Invoke-AgentRun {
             $manifest.cleanup_error = $_.Exception.Message
         } finally {
             $manifest.ended_at = [DateTime]::UtcNow.ToString('o')
+            if ($Agent -eq 'codex' -and $manifest.thread_id) {
+                # The run folder must identify the run's own session so consumers
+                # never fall back to latest-session auto-detect: identity match
+                # only, so overlapping Codex runs cannot borrow another session.
+                try { $manifest.session_file = Resolve-RunSessionFile -SessionsRoot $SessionsRoot -ThreadId ([string]$manifest.thread_id) } catch { }
+            }
             try { Write-RunManifest $manifestPath $manifest }
             finally {
                 $record.seq = 2; $record.ts = [DateTime]::UtcNow.ToString('o'); $record.status = $terminal

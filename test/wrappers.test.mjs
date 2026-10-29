@@ -1,7 +1,7 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, copyFile, lstat, symlink } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, copyFile, lstat, symlink, stat, utimes } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -170,6 +170,77 @@ winTest('PowerShell launcher preserves quotes, spaces, Unicode, multiline and re
   assert.deepEqual(e.events[0].arguments, ['exec', '--json', '--cd', c.dir, '--model', 'requested-model', '-c', "model_reasoning_effort='high'", '-']);
   assert.equal(e.events[0].stdin, prompt);
   assert.match(await readFile(result.err, 'utf8'), /café 中文/);
+});
+
+winTest('run folder records its own Codex session file, not the newest overlapping session', async () => {
+  const c = await setup('session identity');
+  const sessions = path.join(c.dir, 'sessions');
+  const own = path.join(sessions, '2026', '10', '28', 'rollout-2026-10-28T09-00-00-aaaaaaaa-own.jsonl');
+  const decoy = path.join(sessions, '2026', '10', '29', 'rollout-2026-10-29T09-00-00-bbbbbbbb-decoy.jsonl');
+  const noise = path.join(sessions, '2026', '10', '29', 'rollout-2026-10-29T10-00-00-cccccccc-noise.jsonl');
+  await mkdir(path.dirname(own), { recursive: true });
+  await mkdir(path.dirname(decoy), { recursive: true });
+  await mkdir(path.dirname(noise), { recursive: true });
+  const meta = id => `${JSON.stringify({ timestamp: '2026-10-28T09:00:00.000Z', type: 'session_meta', payload: { id, session_id: id } })}\n`;
+  const tokenLine = input => `${JSON.stringify({ timestamp: '2026-10-28T09:00:01.000Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: input, output_tokens: 2, total_tokens: input + 2 } } } })}\n`;
+  await writeFile(own, meta('fast-thread') + tokenLine(40));
+  await writeFile(decoy, meta('decoy-thread') + tokenLine(999999));
+  await writeFile(noise, tokenLine(888888)); // Newest file whose first event is not a session_meta.
+  const future = new Date('2030-01-01T00:00:00Z');
+  await utimes(decoy, future, future);
+  await utimes(noise, future, future);
+  // Overlap repro: newest-file auto-detect would report the decoy run's session/tokens.
+  const newest = (await Promise.all([own, decoy, noise].map(async f => [f, (await stat(f)).mtimeMs])))
+    .sort((a, b) => b[1] - a[1])[0][0];
+  assert.notEqual(newest, own, 'fixture must represent overlapping sessions where recency picks a wrong file');
+
+  const result = await launch(c, { extra: `-SessionsRoot ${quotePS(sessions)}` }).done;
+  const e = await evidence(c, result);
+  assert.equal(result.exit, 0, JSON.stringify(e.manifest));
+  assert.equal(e.manifest.thread_id, 'fast-thread');
+  assert.equal(e.manifest.session_file, own);
+  assert.ok(path.isAbsolute(e.manifest.session_file));
+  assert.notEqual(e.manifest.session_file, decoy);
+  assert.notEqual(e.manifest.session_file, noise);
+});
+
+winTest('Resolve-RunSessionFile matches session identity and ignores newer overlapping sessions', async () => {
+  const c = await setup('resolver');
+  const sessions = path.join(c.dir, 'sessions');
+  const own = path.join(sessions, '2026', '10', '28', 'rollout-own.jsonl');
+  const byThreadField = path.join(sessions, '2026', '10', '28', 'rollout-alt.jsonl');
+  const bySessionField = path.join(sessions, '2026', '10', '28', 'rollout-sid.jsonl');
+  const decoy = path.join(sessions, '2026', '10', '29', 'rollout-decoy.jsonl');
+  const noise = path.join(sessions, '2026', '10', '29', 'rollout-noise.jsonl');
+  const broken = path.join(sessions, '2026', '10', '29', 'rollout-broken.jsonl');
+  await mkdir(path.dirname(own), { recursive: true });
+  await mkdir(path.dirname(decoy), { recursive: true });
+  const meta = (key, id) => `${JSON.stringify({ type: 'session_meta', payload: { [key]: id } })}\n`;
+  await writeFile(own, meta('id', 'fast-thread'));
+  await writeFile(byThreadField, '\uFEFF' + meta('thread_id', 'alt-thread')); // BOM tolerance.
+  await writeFile(bySessionField, meta('session_id', 'sid-thread'));
+  await writeFile(decoy, meta('id', 'decoy-thread'));
+  await writeFile(noise, '{"type":"event_msg"}\n');
+  await writeFile(broken, 'not json\n');
+  const future = new Date('2030-01-01T00:00:00Z');
+  for (const f of [decoy, noise, broken]) await utimes(f, future, future);
+  const source = `
+    $ErrorActionPreference = 'Stop'
+    [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
+    . ${quotePS(path.join(root, 'wrappers/run-common.ps1'))}
+    $found = @(
+      [string](Resolve-RunSessionFile -SessionsRoot ${quotePS(sessions)} -ThreadId 'fast-thread'),
+      [string](Resolve-RunSessionFile -SessionsRoot ${quotePS(sessions)} -ThreadId 'alt-thread'),
+      [string](Resolve-RunSessionFile -SessionsRoot ${quotePS(sessions)} -ThreadId 'sid-thread'),
+      [string](Resolve-RunSessionFile -SessionsRoot ${quotePS(sessions)} -ThreadId 'missing'),
+      [string](Resolve-RunSessionFile -SessionsRoot ${quotePS(sessions)} -ThreadId ''),
+      [string](Resolve-RunSessionFile -SessionsRoot ${quotePS(path.join(c.dir, 'absent'))} -ThreadId 'fast-thread')
+    )
+    [Console]::Out.Write(($found -join '|'))
+  `;
+  const probe = spawnSync(ps, ['-NoProfile', '-NonInteractive', '-EncodedCommand', b64(source)], { windowsHide: true, encoding: 'utf8' });
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.equal(probe.stdout.replace(/^\uFEFF/, ''), [own, byThreadField, bySessionField, '', '', ''].join('|'));
 });
 
 winTest('Cursor stream flags, metadata and legacy OutFile/return fields', async () => {

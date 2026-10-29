@@ -40,6 +40,7 @@ These are private wrapper artifacts, not event sources.
 | `executable`, `cli_version` | Resolved CLI launcher and best-effort version (null if unknown) |
 | `transport`, `launch_executable`, `launch_entry_script` | Selected transport, CLI target and optional Node entry script; null before resolution |
 | `thread_id`, `session_id`, `reported_model` | Native metadata when actually observed; otherwise null |
+| `session_file` | Codex only: absolute path of the run's own session file, matched by `thread_id` against the session's `session_meta` identity under the sessions root; never chosen by recency; null when unmatched |
 | `ended_at`, `exit_code` | UTC end and actual numeric native exit, or null |
 
 Additional diagnostics: `native_failure`, `cleanup_scope`, optional `error`,
@@ -137,7 +138,10 @@ flag native failure. Cursor `system` / `init` captures `session_id` and `model`;
 error results flag native failure. Unknown events remain untouched on disk.
 These native events never invent workflow phases. Future session enrichment
 must match Codex `thread_id` against `session_meta` identity under
-`C:\Users\User\.codex\sessions`; never choose the newest file. v1 does not
+`C:\Users\User\.codex\sessions`; never choose the newest file. At finalize the
+wrapper resolves the run's own session file the same way and records it as
+`session_file` in the manifest (best-effort, null when unmatched), so a run
+folder identifies its own session when Codex runs overlap. v1 does not
 resume threads or claim a resumed-thread token delta. Cursor tokens unavailable.
 
 ## Operations and retention
