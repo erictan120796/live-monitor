@@ -400,3 +400,93 @@ test('codex tokens come from snapshots and cursor tokens are unavailable', async
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
+
+test('output chunks keep monotonic seq numbers across snapshots, SSE, and tail trim', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'live-monitor-seq-'));
+  const runs = path.join(root, 'runs');
+  await mkdir(runs);
+  try {
+    await withServer({ runsRoot: runs, sessionsRoot: path.join(root, 'sessions'), publicDir: path.join(root, 'missing-public') }, async monitor => {
+      const events = openEvents(monitor);
+      try {
+        const runDir = path.join(runs, 'run-seq');
+        const stdout = path.join(root, 'seq-out.txt');
+        await mkdir(runDir);
+        await writeFile(stdout, '');
+        await writeFile(path.join(runDir, 'status.jsonl'), '');
+        await writeFile(path.join(runDir, 'manifest.json'), JSON.stringify({
+          schema_version: 1,
+          run_id: 'run-seq',
+          agent: 'codex',
+          phase: 'review',
+          requested_model: 'gpt-5',
+          effort: 'low',
+          started_at: '2026-10-29T00:00:04.000Z',
+          files: { stdout, stderr: `${stdout}.err`, status: path.join(runDir, 'status.jsonl') },
+        }));
+        await waitFor(async () => (await snapshot(monitor)).runs.some(run => run.run_id === 'run-seq'), 1000);
+        await appendFile(stdout, 'alpha\nbeta\n');
+        const streamed = await waitFor(() => {
+          const found = events.events.filter(item => item.event === 'stdout' && item.data.run_id === 'run-seq');
+          return found.length >= 2 ? found : null;
+        });
+        assert.ok(streamed);
+        assert.equal(streamed[0].data.seq, 1);
+        assert.equal(streamed[1].data.seq, 2);
+        assert.ok(streamed[1].data.seq > streamed[0].data.seq);
+
+        const first = await waitFor(async () => {
+          const run = (await snapshot(monitor)).runs.find(item => item.run_id === 'run-seq');
+          return run?.output_seq?.length === 2 ? run : null;
+        });
+        assert.deepEqual(first.output_tail, ['alpha', 'beta']);
+        assert.deepEqual(first.output_seq, [1, 2]);
+        const again = await snapshot(monitor);
+        assert.deepEqual(again.runs.find(item => item.run_id === 'run-seq').output_seq, [1, 2]);
+
+        await appendFile(stdout, 'alpha\n');
+        await appendFile(stdout, `${JSON.stringify({
+          type: 'item.completed',
+          item: { id: 'item_blank', type: 'agent_message', text: '\nbeta' },
+        })}\n`);
+        const grown = await waitFor(async () => {
+          const run = (await snapshot(monitor)).runs.find(item => item.run_id === 'run-seq');
+          return run?.output_seq?.length === 5 ? run : null;
+        });
+        assert.deepEqual(grown.output_tail, ['alpha', 'beta', 'alpha', '', 'beta']);
+        assert.deepEqual(grown.output_seq, [1, 2, 3, 4, 5]);
+        const blankEvent = events.events.find(item => item.event === 'stdout' && item.data.run_id === 'run-seq' && item.data.seq === 4);
+        assert.equal(blankEvent?.data?.seq, 4);
+
+        const pads = Array.from({ length: 196 }, (_, index) => `pad ${index}`).join('\n');
+        await appendFile(stdout, `${pads}\n`);
+        const trimmed = await waitFor(async () => {
+          const run = (await snapshot(monitor)).runs.find(item => item.run_id === 'run-seq');
+          return run?.output_tail?.length === 200 ? run : null;
+        }, 2000);
+        assert.equal(trimmed.output_seq.length, 200);
+        assert.equal(trimmed.output_seq[0], 2);
+        assert.equal(trimmed.output_seq[199], 201);
+        for (let i = 1; i < trimmed.output_seq.length; i += 1) {
+          assert.equal(trimmed.output_seq[i], trimmed.output_seq[i - 1] + 1);
+        }
+        assert.equal(trimmed.output_tail[0], 'beta');
+        const held = await snapshot(monitor);
+        assert.deepEqual(held.runs.find(item => item.run_id === 'run-seq').output_seq, trimmed.output_seq);
+
+        await appendFile(stdout, 'after\n');
+        const after = await waitFor(async () => {
+          const run = (await snapshot(monitor)).runs.find(item => item.run_id === 'run-seq');
+          return run?.output_seq?.[199] === 202 ? run : null;
+        });
+        assert.equal(after.output_seq[0], 3);
+        assert.equal(after.output_seq[199], 202);
+        assert.equal(after.output_tail[199], 'after');
+      } finally {
+        await events.stop();
+      }
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});

@@ -52,28 +52,54 @@ function parseStatus(line) {
   }
 }
 
+function allocSeq(state) {
+  const seq = state.nextSeq;
+  state.nextSeq += 1;
+  return seq;
+}
+
+function pushChunk(state, text) {
+  const seq = allocSeq(state);
+  state.tail.push(text);
+  state.seqs.push(seq);
+  return seq;
+}
+
 function pushLines(state, text) {
   state.openPartial = false;
-  if (!text) return;
-  for (const line of String(text).split('\n')) {
-    if (line.length) state.tail.push(line);
+  if (text == null) return null;
+  const lines = String(text).split('\n');
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+  if (!lines.length) return null;
+  let first = null;
+  for (const line of lines) {
+    const seq = pushChunk(state, line);
+    if (first == null) first = seq;
   }
   trimTail(state);
+  return first;
 }
 
 function pushPartial(state, text) {
   state.sawPartial = true;
-  if (!text) return;
+  if (!text) return state.openPartial ? state.seqs[state.seqs.length - 1] ?? null : null;
+  let seq;
   if (!state.openPartial) {
-    state.tail.push('');
+    seq = pushChunk(state, '');
     state.openPartial = true;
+  } else {
+    seq = state.seqs[state.seqs.length - 1];
   }
   state.tail[state.tail.length - 1] += text;
   trimTail(state);
+  return seq;
 }
 
 function trimTail(state) {
-  if (state.tail.length > TAIL_LIMIT) state.tail.splice(0, state.tail.length - TAIL_LIMIT);
+  if (state.tail.length <= TAIL_LIMIT) return;
+  const drop = state.tail.length - TAIL_LIMIT;
+  state.tail.splice(0, drop);
+  state.seqs.splice(0, drop);
 }
 
 function codexTailText(state, parsed) {
@@ -96,29 +122,26 @@ function codexTailText(state, parsed) {
 
 function applyOutput(state, parsed, raw) {
   if (!parsed) {
-    pushLines(state, raw);
-    return null;
+    return { text: null, seq: pushLines(state, raw) };
   }
   if (parsed.agent === 'codex') {
     const text = codexTailText(state, parsed);
-    if (text) pushLines(state, text);
-    return text;
+    return { text, seq: text ? pushLines(state, text) : null };
   }
   if (parsed.kind === 'assistant_partial') {
-    pushPartial(state, parsed.text ?? '');
-    return parsed.text ?? '';
+    const text = parsed.text ?? '';
+    return { text, seq: pushPartial(state, text) };
   }
   if (parsed.kind === 'tool_call' && parsed.subtype === 'started') {
     const text = `tool ${parsed.name ?? 'call'}`;
-    pushLines(state, text);
-    return text;
+    return { text, seq: pushLines(state, text) };
   }
   if (parsed.kind === 'result' && parsed.text && !state.sawPartial) {
-    pushLines(state, parsed.text);
-    return parsed.text;
+    const text = parsed.text;
+    return { text, seq: pushLines(state, text) };
   }
   if (parsed.kind !== 'assistant_partial') state.openPartial = false;
-  return null;
+  return { text: null, seq: null };
 }
 
 function blankRun(manifest) {
@@ -143,6 +166,8 @@ function blankRun(manifest) {
     stdoutPath: manifest.files?.stdout ?? null,
     statusPath: manifest.files?.status ?? null,
     tail: [],
+    seqs: [],
+    nextSeq: 1,
     openPartial: false,
     sawPartial: false,
     commands: new Set(),
@@ -211,6 +236,7 @@ function viewRun(state, now) {
       duration_ms,
     },
     output_tail: state.tail.slice(),
+    output_seq: state.seqs.slice(),
     tokens: projectTokens(state.tokens),
   };
 }
@@ -299,8 +325,8 @@ function onStdout(ctx, state, line) {
     if (parsed.model) state.reported_model = parsed.model;
   }
   if (parsed?.kind === 'turn.completed') applyTurnCompleted(state.tokens, parsed.usage);
-  const text = applyOutput(state, parsed, line);
-  broadcast(ctx, 'stdout', { run_id: state.run_id, line, text });
+  const produced = applyOutput(state, parsed, line);
+  broadcast(ctx, 'stdout', { run_id: state.run_id, line, text: produced.text, seq: produced.seq });
 }
 
 function onStatus(ctx, state, line) {

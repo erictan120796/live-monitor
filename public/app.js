@@ -413,193 +413,16 @@ function bindTiming(el, start, end) {
   el.textContent = formatDuration(elapsedMs(start, end, Date.now()));
 }
 
-const outputMarks = new Map();
+const cutoffs = new Map();
 
-function markFor(runId) {
-  let state = outputMarks.get(runId);
-  if (!state) {
-    state = { cutoff: 0, high: 0, nextSeq: 1, lines: [], origin: 0, stream: '', received: 0, spans: [] };
-    outputMarks.set(runId, state);
-  }
-  return state;
+function cutoffFor(runId) {
+  return cutoffs.get(runId) ?? 0;
 }
 
-function raiseHigh(state, seq) {
-  if (seq > state.high) state.high = seq;
-  if (seq >= state.nextSeq) state.nextSeq = seq + 1;
-}
-
-function tryConsume(prev, index, text) {
-  const line = prev[index];
-  if (!line || typeof text !== 'string') return null;
-  if (line.text === text) return { seq: line.seq, next: index + 1 };
-  if (!line.text || !text.startsWith(line.text)) return null;
-  let built = line.text;
-  let next = index + 1;
-  while (next < prev.length && prev[next].text && text.startsWith(built + prev[next].text)) {
-    built += prev[next].text;
-    next += 1;
-  }
-  if (line.partial || next > index + 1) return { seq: line.seq, next };
-  return null;
-}
-
-function walkLines(prev, drop, texts, nextSeq) {
-  let pi = drop;
-  let seq = nextSeq;
-  const lines = [];
-  for (let ti = 0; ti < texts.length; ti += 1) {
-    const consumed = tryConsume(prev, pi, texts[ti]);
-    if (consumed) {
-      lines.push({ text: texts[ti], seq: consumed.seq, partial: false });
-      pi = consumed.next;
-      continue;
-    }
-    if (pi < prev.length) return null;
-    lines.push({ text: texts[ti], seq, partial: false });
-    seq += 1;
-  }
-  if (pi !== prev.length) return null;
-  return { lines, nextSeq: seq };
-}
-
-function fallbackLines(prev, texts, nextSeq) {
-  const lines = [];
-  let seq = nextSeq;
-  for (let i = 0; i < texts.length; i += 1) {
-    if (i < prev.length) lines.push({ text: texts[i], seq: prev[i].seq, partial: false });
-    else {
-      lines.push({ text: texts[i], seq, partial: false });
-      seq += 1;
-    }
-  }
-  return { lines, nextSeq: seq };
-}
-
-function reusedCount(lines, prev) {
-  const known = new Set(prev.map(line => line.seq));
-  let count = 0;
-  for (const line of lines) if (known.has(line.seq)) count += 1;
-  return count;
-}
-
-function keepPartial(prevLines, texts) {
-  if (!prevLines.length || !texts.length) return false;
-  const last = prevLines[prevLines.length - 1];
-  if (!last?.partial) return false;
-  if (texts.length > prevLines.length) return false;
-  if (texts[texts.length - 1] !== last.text) return false;
-  const prevBody = prevLines.slice(0, -1).map(line => line.text);
-  const nextBody = texts.slice(0, -1);
-  const drop = prevBody.length - nextBody.length;
-  for (let i = 0; i < nextBody.length; i += 1) {
-    if (prevBody[drop + i] !== nextBody[i]) return false;
-  }
-  return true;
-}
-
-function contentOf(raw) {
-  return String(raw).replace(/\r\n|\n|\r/g, '');
-}
-
-function textAfter(raw, skip) {
-  if (skip <= 0) return String(raw);
-  const text = String(raw);
-  let seen = 0;
-  let i = 0;
-  while (i < text.length) {
-    const code = text.charCodeAt(i);
-    if (code === 10) {
-      i += 1;
-      continue;
-    }
-    if (code === 13) {
-      i += text.charCodeAt(i + 1) === 10 ? 2 : 1;
-      continue;
-    }
-    seen += 1;
-    i += 1;
-    if (seen >= skip) return text.slice(i);
-  }
-  return '';
-}
-
-// Cutoff is a cumulative content-char offset. Line breaks are not counted, so
-// a snapshot that re-splits the same characters keeps those offsets.
-function placeContent(state, content) {
-  const prev = state.stream;
-  const origin = state.origin;
-  if (!content) return origin + prev.length;
-  let start = origin;
-  if (!prev || content.startsWith(prev)) {
-    start = origin;
-  } else if (prev.includes(content)) {
-    start = origin + prev.lastIndexOf(content);
-  } else {
-    const at = content.indexOf(prev);
-    if (at >= 0 && origin >= at) {
-      start = origin - at;
-    } else {
-      let overlap = 0;
-      const max = Math.min(prev.length, content.length);
-      for (let n = max; n > 0; n -= 1) {
-        if (prev.slice(prev.length - n) === content.slice(0, n)) {
-          overlap = n;
-          break;
-        }
-      }
-      start = overlap > 0 ? origin + prev.length - overlap : origin + prev.length;
-    }
-  }
-  state.origin = start;
-  state.stream = content;
-  const end = start + content.length;
-  if (end > state.received) state.received = end;
-  return start;
-}
-
-function syncMarks(run) {
-  const state = markFor(run.run_id);
-  const texts = Array.isArray(run.output_tail) ? run.output_tail.map(line => String(line)) : [];
-  if (!texts.length) {
-    state.spans = [];
-    return state;
-  }
-  const prev = state.lines;
-  const unchanged = prev.length === texts.length && prev.every((line, index) => line.text === texts[index]);
-  if (!unchanged) {
-    let chosen = null;
-    for (let drop = 0; drop <= prev.length; drop += 1) {
-      const walked = walkLines(prev, drop, texts, state.nextSeq);
-      if (!walked) continue;
-      if (prev.length && reusedCount(walked.lines, prev) === 0) continue;
-      chosen = walked;
-      break;
-    }
-    if (!chosen) chosen = prev.length ? fallbackLines(prev, texts, state.nextSeq) : walkLines(prev, 0, texts, state.nextSeq);
-    state.lines = chosen.lines;
-    state.nextSeq = chosen.nextSeq;
-  }
-  for (const line of state.lines) {
-    line.partial = false;
-    raiseHigh(state, line.seq);
-  }
-  if (run._openPartial && state.lines.length) state.lines[state.lines.length - 1].partial = true;
-  const pieces = texts.map(contentOf);
-  let cursor = 0;
-  const ranges = [];
-  for (let i = 0; i < texts.length; i += 1) {
-    const start = cursor;
-    cursor += pieces[i].length;
-    ranges.push({ text: texts[i], start, end: cursor });
-  }
-  const base = placeContent(state, pieces.join(''));
-  state.spans = ranges.map(range => ({
-    text: range.text,
-    start: base + range.start,
-    end: base + range.end,
-  }));
-  return state;
+function chunkSeq(run, index) {
+  const seqs = run?.output_seq;
+  const seq = Array.isArray(seqs) ? seqs[index] : undefined;
+  return typeof seq === 'number' && Number.isFinite(seq) ? seq : null;
 }
 
 function phaseSuffix(taskRuns, status) {
@@ -797,19 +620,19 @@ function visibleEntries(run) {
   if (!run) return [];
   const texts = Array.isArray(run.output_tail) ? run.output_tail : [];
   if (!texts.length) return [];
-  const state = syncMarks(run);
+  const cutoff = cutoffFor(run.run_id);
   const entries = Array.isArray(run._meta) ? run._meta : [];
   const visible = [];
-  for (let i = 0; i < state.spans.length; i += 1) {
-    const span = state.spans[i];
-    if (span.end <= state.cutoff) continue;
+  for (let i = 0; i < texts.length; i += 1) {
+    const seq = chunkSeq(run, i);
+    if (seq == null || !(seq > cutoff)) continue;
+    const text = String(texts[i]);
     const entry = entries[i];
-    const source = entry ? entry.text : span.text;
-    const shown = span.start >= state.cutoff ? source : textAfter(source, state.cutoff - span.start);
-    if (!shown) continue;
-    if (entry && shown === entry.text) visible.push(entry);
-    else if (entry) visible.push({ text: shown, time: entry.time || null, tag: entry.tag });
-    else visible.push({ text: shown, time: null, tag: safeTag(tagFromText(span.text)) });
+    visible.push({
+      text,
+      time: entry?.time || null,
+      tag: safeTag(entry?.tag || tagFromText(text)),
+    });
   }
   return visible;
 }
@@ -921,30 +744,24 @@ function tick() {
   }
 }
 
-function realignMeta(previous, tail) {
-  const result = [];
-  let cursor = 0;
-  const prior = Array.isArray(previous) ? previous : [];
-  for (const text of tail) {
-    let found = -1;
-    for (let i = cursor; i < prior.length; i += 1) {
-      if (prior[i].text === text) {
-        found = i;
-        break;
-      }
-    }
-    if (found >= 0) {
-      result.push({
-        text,
-        time: prior[found].time || null,
-        tag: safeTag(prior[found].tag || tagFromText(text)),
-      });
-      cursor = found + 1;
-    } else {
-      result.push({ text, time: null, tag: safeTag(tagFromText(text)) });
-    }
+function metaBySeq(previous, tail, seqs) {
+  const prior = new Map();
+  const oldMeta = Array.isArray(previous?._meta) ? previous._meta : [];
+  const oldSeq = Array.isArray(previous?.output_seq) ? previous.output_seq : [];
+  for (let i = 0; i < oldMeta.length; i += 1) {
+    const seq = oldSeq[i];
+    if (typeof seq === 'number' && Number.isFinite(seq)) prior.set(seq, oldMeta[i]);
   }
-  return result;
+  return tail.map((text, index) => {
+    const raw = String(text);
+    const seq = seqs[index];
+    const old = typeof seq === 'number' && Number.isFinite(seq) ? prior.get(seq) : null;
+    return {
+      text: raw,
+      time: old?.time || null,
+      tag: safeTag(old?.tag || tagFromText(raw)),
+    };
+  });
 }
 
 function applySnapshot(body) {
@@ -952,13 +769,11 @@ function applySnapshot(body) {
   const next = Array.isArray(body?.runs) ? body.runs : [];
   for (const run of next) {
     if (!Array.isArray(run.output_tail)) run.output_tail = [];
+    if (!Array.isArray(run.output_seq)) run.output_seq = [];
     const old = previous.get(run.run_id);
-    run._meta = realignMeta(old?._meta, run.output_tail);
+    run._meta = metaBySeq(old, run.output_tail, run.output_seq);
     run._errors = Array.isArray(old?._errors) ? old._errors : [];
-    const prior = outputMarks.get(run.run_id);
-    run._openPartial = Boolean(prior && keepPartial(prior.lines, run.output_tail));
     harvestErrors(run);
-    syncMarks(run);
   }
   runs = next;
   if (!runs.some(run => run.run_id === selectedRunId)) {
@@ -1005,46 +820,47 @@ function trimTail(run) {
   if (run.output_tail.length <= TAIL_LIMIT) return;
   const drop = run.output_tail.length - TAIL_LIMIT;
   run.output_tail.splice(0, drop);
+  if (Array.isArray(run.output_seq)) run.output_seq.splice(0, Math.min(drop, run.output_seq.length));
   if (Array.isArray(run._meta)) run._meta.splice(0, Math.min(drop, run._meta.length));
 }
 
 function applyStdout(run, data) {
   if (!Array.isArray(run.output_tail)) run.output_tail = [];
+  if (!Array.isArray(run.output_seq)) run.output_seq = [];
   if (!Array.isArray(run._meta)) run._meta = [];
   const time = timeFromRaw(data.line);
   const errText = errorTextFromRaw(data.line);
   if (errText) noteError(run, errText, time);
+  const seq = typeof data.seq === 'number' && Number.isFinite(data.seq) ? data.seq : null;
   if (isPartial(data.line)) {
     const chunk = typeof data.text === 'string' ? data.text : '';
     if (!chunk) return;
     const tag = tagFromEvent(data.line, chunk);
-    const lastMark = outputMarks.get(run.run_id)?.lines;
-    const open = Boolean(run._openPartial || (lastMark?.length && lastMark[lastMark.length - 1].partial));
-    if (!open || !run.output_tail.length) {
-      run.output_tail.push(chunk);
-      run._meta.push({ text: chunk, time, tag });
-      run._openPartial = true;
-    } else {
-      const last = run.output_tail.length - 1;
+    const last = run.output_tail.length - 1;
+    if (seq != null && last >= 0 && run.output_seq[last] === seq) {
       run.output_tail[last] += chunk;
       if (run._meta[last]) run._meta[last].text += chunk;
       else run._meta[last] = { text: run.output_tail[last], time, tag };
-      run._openPartial = true;
+    } else {
+      run.output_tail.push(chunk);
+      run.output_seq.push(seq);
+      run._meta.push({ text: chunk, time, tag });
     }
-  } else {
-    run._openPartial = false;
-    if (typeof data.text === 'string' && data.text.length) {
-      const parts = data.text.split('\n').filter(line => line.length);
-      parts.forEach((line, index) => {
-        const tag = index === 0 ? tagFromEvent(data.line, line) : safeTag(tagFromText(line));
-        run.output_tail.push(line);
-        run._meta.push({ text: line, time, tag });
-        if (tag === 'ERROR') noteError(run, line, time);
-      });
-    }
+  } else if (typeof data.text === 'string' && data.text.length) {
+    const parts = data.text.split('\n');
+    if (parts.length > 1 && parts[parts.length - 1] === '') parts.pop();
+    let offset = 0;
+    parts.forEach((line, index) => {
+      const tag = index === 0 ? tagFromEvent(data.line, line) : safeTag(tagFromText(line));
+      const lineSeq = seq == null ? null : seq + offset;
+      offset += 1;
+      run.output_tail.push(line);
+      run.output_seq.push(lineSeq);
+      run._meta.push({ text: line, time, tag });
+      if (tag === 'ERROR' && line.length) noteError(run, line, time);
+    });
   }
   trimTail(run);
-  syncMarks(run);
 }
 
 function onStdout(data) {
@@ -1129,8 +945,13 @@ function onTimelineClick(event) {
 function onClear() {
   const run = selectedRun();
   if (!run) return;
-  const state = syncMarks(run);
-  if (state.received > state.cutoff) state.cutoff = state.received;
+  const texts = Array.isArray(run.output_tail) ? run.output_tail : [];
+  let high = cutoffFor(run.run_id);
+  for (let i = 0; i < texts.length; i += 1) {
+    const seq = chunkSeq(run, i);
+    if (seq != null && seq > high) high = seq;
+  }
+  cutoffs.set(run.run_id, high);
   renderOutput();
 }
 
