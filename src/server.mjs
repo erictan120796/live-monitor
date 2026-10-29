@@ -83,14 +83,16 @@ function pushLines(state, text) {
 function pushPartial(state, text) {
   state.sawPartial = true;
   if (!text) return state.openPartial ? state.seqs[state.seqs.length - 1] ?? null : null;
-  let seq;
-  if (!state.openPartial) {
-    seq = pushChunk(state, '');
+  const seq = allocSeq(state);
+  if (!state.openPartial || state.tail.length === 0) {
+    state.tail.push(text);
+    state.seqs.push(seq);
     state.openPartial = true;
   } else {
-    seq = state.seqs[state.seqs.length - 1];
+    const last = state.tail.length - 1;
+    state.tail[last] += text;
+    state.seqs[last] = seq;
   }
-  state.tail[state.tail.length - 1] += text;
   trimTail(state);
   return seq;
 }

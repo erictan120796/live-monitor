@@ -773,6 +773,10 @@ function applySnapshot(body) {
     const old = previous.get(run.run_id);
     run._meta = metaBySeq(old, run.output_tail, run.output_seq);
     run._errors = Array.isArray(old?._errors) ? old._errors : [];
+    const oldTail = Array.isArray(old?.output_tail) ? old.output_tail : [];
+    const sameLength = run.output_tail.length === oldTail.length && run.output_tail.length > 0;
+    const lastGrew = sameLength && String(run.output_tail[run.output_tail.length - 1]).startsWith(String(oldTail[oldTail.length - 1]));
+    run._openPartial = Boolean(old?._openPartial && lastGrew);
     harvestErrors(run);
   }
   runs = next;
@@ -837,16 +841,19 @@ function applyStdout(run, data) {
     if (!chunk) return;
     const tag = tagFromEvent(data.line, chunk);
     const last = run.output_tail.length - 1;
-    if (seq != null && last >= 0 && run.output_seq[last] === seq) {
+    if (run._openPartial && last >= 0) {
       run.output_tail[last] += chunk;
+      if (seq != null) run.output_seq[last] = seq;
       if (run._meta[last]) run._meta[last].text += chunk;
       else run._meta[last] = { text: run.output_tail[last], time, tag };
     } else {
       run.output_tail.push(chunk);
       run.output_seq.push(seq);
       run._meta.push({ text: chunk, time, tag });
+      run._openPartial = true;
     }
   } else if (typeof data.text === 'string' && data.text.length) {
+    run._openPartial = false;
     const parts = data.text.split('\n');
     if (parts.length > 1 && parts[parts.length - 1] === '') parts.pop();
     let offset = 0;
@@ -859,6 +866,8 @@ function applyStdout(run, data) {
       run._meta.push({ text: line, time, tag });
       if (tag === 'ERROR' && line.length) noteError(run, line, time);
     });
+  } else {
+    run._openPartial = false;
   }
   trimTail(run);
 }

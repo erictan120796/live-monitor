@@ -490,3 +490,70 @@ test('output chunks keep monotonic seq numbers across snapshots, SSE, and tail t
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 });
+
+test('partial chunks get increasing seqs and the snapshot line seq advances', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'live-monitor-partial-seq-'));
+  const runs = path.join(root, 'runs');
+  await mkdir(runs);
+  try {
+    await withServer({ runsRoot: runs, sessionsRoot: path.join(root, 'sessions'), publicDir: path.join(root, 'missing-public') }, async monitor => {
+      const events = openEvents(monitor);
+      try {
+        const runDir = path.join(runs, 'run-partial');
+        const stdout = path.join(runDir, 'stdout.jsonl');
+        await mkdir(runDir);
+        await writeFile(stdout, '');
+        await writeFile(path.join(runDir, 'status.jsonl'), '');
+        await writeFile(path.join(runDir, 'manifest.json'), JSON.stringify({
+          schema_version: 1,
+          run_id: 'run-partial',
+          agent: 'cursor',
+          phase: 'code',
+          requested_model: 'grok-4.7-medium',
+          started_at: '2026-10-29T00:00:05.000Z',
+          files: { stdout, stderr: path.join(runDir, 'stderr.log'), status: path.join(runDir, 'status.jsonl') },
+        }));
+        await waitFor(async () => (await snapshot(monitor)).runs.some(run => run.run_id === 'run-partial'), 1000);
+        const partial = (text, ts) => `${JSON.stringify({
+          type: 'assistant',
+          timestamp_ms: ts,
+          message: { content: [{ type: 'text', text }] },
+        })}\n`;
+        await appendFile(stdout, partial('Hel', 10));
+        const first = await waitFor(async () => {
+          const run = (await snapshot(monitor)).runs.find(item => item.run_id === 'run-partial');
+          return run?.output_seq?.length === 1 ? run : null;
+        });
+        assert.deepEqual(first.output_tail, ['Hel']);
+        assert.deepEqual(first.output_seq, [1]);
+        await appendFile(stdout, partial('lo', 11));
+        const second = await waitFor(async () => {
+          const run = (await snapshot(monitor)).runs.find(item => item.run_id === 'run-partial');
+          return run?.output_seq?.[0] === 2 ? run : null;
+        });
+        assert.deepEqual(second.output_tail, ['Hello']);
+        assert.deepEqual(second.output_seq, [2]);
+        await appendFile(stdout, partial('!', 12));
+        const third = await waitFor(async () => {
+          const run = (await snapshot(monitor)).runs.find(item => item.run_id === 'run-partial');
+          return run?.output_seq?.[0] === 3 ? run : null;
+        });
+        assert.deepEqual(third.output_tail, ['Hello!']);
+        assert.deepEqual(third.output_seq, [3]);
+        const streamed = await waitFor(() => {
+          const found = events.events.filter(item => item.event === 'stdout' && item.data.run_id === 'run-partial');
+          return found.length >= 3 ? found : null;
+        });
+        assert.ok(streamed);
+        assert.deepEqual(streamed.slice(0, 3).map(item => item.data.seq), [1, 2, 3]);
+        assert.deepEqual(streamed.slice(0, 3).map(item => item.data.text), ['Hel', 'lo', '!']);
+        assert.ok(streamed[1].data.seq > streamed[0].data.seq);
+        assert.ok(streamed[2].data.seq > streamed[1].data.seq);
+      } finally {
+        await events.stop();
+      }
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
