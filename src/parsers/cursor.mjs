@@ -74,6 +74,7 @@ export function parseCursorLine(line) {
       type: event.type,
       subtype,
       is_error: event.is_error === true || (subtype != null && subtype.startsWith('error')),
+      raw_is_error: event.is_error,
       timestamp: typeof event.timestamp === 'string' ? event.timestamp : null,
       text: typeof event.result === 'string' ? event.result : null,
       session_id: typeof event.session_id === 'string' ? event.session_id : null,

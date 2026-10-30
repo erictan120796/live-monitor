@@ -559,7 +559,7 @@ test('partial chunks get increasing seqs and the snapshot line seq advances', as
 });
 
 function resultLine(usage, timestamp) {
-  return JSON.stringify({ type: 'result', subtype: 'success', timestamp, usage });
+  return JSON.stringify({ type: 'result', subtype: 'success', is_error: false, timestamp, usage });
 }
 
 function toolLine(index) {
@@ -697,7 +697,7 @@ test('error results infer failed without inventing an exit code', async () => {
     await writeRun(runs, {
       id: 'subtype-error',
       status: 'started',
-      lines: [JSON.stringify({ type: 'result', subtype: 'error_during_execution', timestamp: '2026-11-01T02:05:00.000Z', result: 'bad' })],
+      lines: [JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, timestamp: '2026-11-01T02:05:00.000Z', result: 'bad' })],
     });
     await withServer(staleServer(root, runs), async monitor => {
       const body = await snapshot(monitor);
@@ -763,7 +763,7 @@ test('real terminal status overrides a conflicting cursor result in both orders'
         assert.equal(failed.status_reason, 'boom');
         assert.equal(failed.exit_code, 2);
 
-        await appendFile(thenCompleted.stdout, `${JSON.stringify({ type: 'result', subtype: 'error_during_execution', timestamp: '2026-11-01T02:05:00.000Z' })}\n`);
+        await appendFile(thenCompleted.stdout, `${JSON.stringify({ type: 'result', subtype: 'error_during_execution', is_error: true, timestamp: '2026-11-01T02:05:00.000Z' })}\n`);
         await waitFor(async () => findRun(await snapshot(monitor), 'result-then-completed')?.status === 'failed');
         await appendFile(thenCompleted.statusPath, `${JSON.stringify({
           v: 1, seq: 2, ts: '2026-11-01T06:00:00.000Z', run_id: 'result-then-completed', phase: 'code', status: 'completed', reason: 'shipped', exit_code: 0,
@@ -798,6 +798,39 @@ test('real terminal status overrides a conflicting cursor result in both orders'
         assert.equal(stillFailed.exit_code, 2);
       } finally {
         await events.stop();
+      }
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test('non-boolean is_error leaves a started run unchanged', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'live-monitor-stale-raw-error-'));
+  const runs = path.join(root, 'runs');
+  await mkdir(runs);
+  try {
+    await writeRun(runs, {
+      id: 'string-true',
+      status: 'started',
+      lines: [JSON.stringify({ type: 'result', subtype: 'success', is_error: 'true', timestamp: RESULT_ENDED })],
+    });
+    await writeRun(runs, {
+      id: 'null-flag',
+      status: 'started',
+      lines: [JSON.stringify({ type: 'result', subtype: 'success', is_error: null, timestamp: RESULT_ENDED })],
+    });
+    await writeRun(runs, {
+      id: 'missing-flag',
+      status: 'started',
+      lines: [JSON.stringify({ type: 'result', subtype: 'success', timestamp: RESULT_ENDED })],
+    });
+    await withServer(staleServer(root, runs), async monitor => {
+      const body = await snapshot(monitor);
+      for (const id of ['string-true', 'null-flag', 'missing-flag']) {
+        const run = findRun(body, id);
+        assert.equal(run.status, 'started', id);
+        assert.equal(run.timings.ended_at, null, id);
       }
     });
   } finally {

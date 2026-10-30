@@ -224,8 +224,8 @@ function validResultEndedAt(timestamp) {
 function trackCursorResult(state, parsed) {
   if (!parsed || parsed.kind !== 'result') return;
   let resultStatus = null;
-  if (parsed.subtype === 'success' && parsed.is_error === false) resultStatus = 'completed';
-  else if (parsed.is_error === true) resultStatus = 'failed';
+  if (parsed.subtype === 'success' && parsed.raw_is_error === false) resultStatus = 'completed';
+  else if (parsed.raw_is_error === true) resultStatus = 'failed';
   else return;
   state.result_status = resultStatus;
   state.result_ended_at = validResultEndedAt(parsed.timestamp);
