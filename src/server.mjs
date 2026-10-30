@@ -169,6 +169,8 @@ function blankRun(manifest) {
     native_failure: manifest.native_failure === true,
     started_at: manifest.started_at ?? null,
     ended_at: manifest.ended_at ?? null,
+    result_status: null,
+    result_ended_at: null,
     stdoutPath: manifest.files?.stdout ?? null,
     statusPath: manifest.files?.status ?? null,
     tail: [],
@@ -213,9 +215,36 @@ function applyStatus(state, record) {
   }
 }
 
+function validResultEndedAt(timestamp) {
+  if (typeof timestamp !== 'string' || !/^\d{4}-\d{2}-\d{2}T/.test(timestamp)) return null;
+  const ms = Date.parse(timestamp);
+  return Number.isFinite(ms) ? timestamp : null;
+}
+
+function trackCursorResult(state, parsed) {
+  if (!parsed || parsed.kind !== 'result') return;
+  let resultStatus = null;
+  if (parsed.subtype === 'success' && parsed.is_error === false) resultStatus = 'completed';
+  else if (parsed.is_error === true) resultStatus = 'failed';
+  else return;
+  state.result_status = resultStatus;
+  state.result_ended_at = validResultEndedAt(parsed.timestamp);
+}
+
+function effectiveRunOutcome(state) {
+  if (state.status === 'completed' || state.status === 'failed') {
+    return { status: state.status, endTime: state.ended_at ?? null };
+  }
+  if (state.status === 'started' && (state.result_status === 'completed' || state.result_status === 'failed')) {
+    return { status: state.result_status, endTime: state.result_ended_at ?? null };
+  }
+  return { status: state.status, endTime: state.ended_at ?? null };
+}
+
 function viewRun(state, now) {
+  const outcome = effectiveRunOutcome(state);
   const startedMs = Date.parse(state.started_at ?? '');
-  const endedMs = state.ended_at ? Date.parse(state.ended_at) : NaN;
+  const endedMs = outcome.endTime ? Date.parse(outcome.endTime) : NaN;
   const duration_ms = Number.isFinite(startedMs)
     ? (Number.isFinite(endedMs) ? endedMs - startedMs : now - startedMs)
     : null;
@@ -229,7 +258,7 @@ function viewRun(state, now) {
     reported_model: state.reported_model,
     effort: state.effort,
     phase: state.phase,
-    status: state.status,
+    status: outcome.status,
     status_reason: state.status_reason,
     exit_code: state.exit_code,
     thread_id: state.thread_id,
@@ -238,7 +267,7 @@ function viewRun(state, now) {
     native_failure: state.native_failure,
     timings: {
       started_at: state.started_at,
-      ended_at: state.ended_at,
+      ended_at: outcome.endTime,
       duration_ms,
     },
     output_tail: state.tail.slice(),
@@ -340,8 +369,20 @@ async function sendStatic(res, publicDir, urlPath) {
   }
 }
 
+function broadcastRunStatus(ctx, state) {
+  const outcome = effectiveRunOutcome(state);
+  broadcast(ctx, 'status', {
+    run_id: state.run_id,
+    status: outcome.status,
+    phase: state.phase,
+    reason: state.status_reason,
+    exit_code: state.exit_code,
+  });
+}
+
 function onStdout(ctx, state, line) {
   if (ctx.closed) return;
+  const before = effectiveRunOutcome(state).status;
   const parsed = state.agent === 'cursor'
     ? parseCursorLine(line)
     : state.agent === 'codex'
@@ -358,8 +399,11 @@ function onStdout(ctx, state, line) {
   if (parsed?.kind === 'turn.completed') applyTurnCompleted(state.tokens, parsed.usage);
   if (state.agent === 'cursor' && parsed?.kind === 'result') {
     applyCursorResult(state.tokens, cursorResultFromLine(line));
+    trackCursorResult(state, parsed);
   }
   const produced = applyOutput(state, parsed, line);
+  const after = effectiveRunOutcome(state).status;
+  if (before !== after) broadcastRunStatus(ctx, state);
   broadcast(ctx, 'stdout', { run_id: state.run_id, line, text: produced.text, seq: produced.seq });
 }
 
@@ -367,14 +411,10 @@ function onStatus(ctx, state, line) {
   if (ctx.closed) return;
   const record = parseStatus(line);
   if (!record) return;
+  const before = effectiveRunOutcome(state).status;
   applyStatus(state, record);
-  broadcast(ctx, 'status', {
-    run_id: state.run_id,
-    status: state.status,
-    phase: state.phase,
-    reason: state.status_reason,
-    exit_code: state.exit_code,
-  });
+  const after = effectiveRunOutcome(state).status;
+  if (before !== after || record.status) broadcastRunStatus(ctx, state);
 }
 
 function onSessionLine(state, line) {
@@ -432,7 +472,12 @@ async function upsert(ctx, found) {
   }
   await ensureSession(ctx, state);
   if (created && !ctx.closed) {
-    broadcast(ctx, 'run', { run_id: state.run_id, agent: state.agent, phase: state.phase, status: state.status });
+    broadcast(ctx, 'run', {
+      run_id: state.run_id,
+      agent: state.agent,
+      phase: state.phase,
+      status: effectiveRunOutcome(state).status,
+    });
   }
 }
 

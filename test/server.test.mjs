@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, appendFile, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, appendFile, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir, homedir } from 'node:os';
 import path from 'node:path';
 import { discoverRuns, defaultRunsRoot } from '../src/discovery.mjs';
@@ -595,6 +595,299 @@ async function writeRun(runs, { id, agent = 'cursor', ended, status = 'completed
   await writeFile(path.join(dir, 'manifest.json'), JSON.stringify(manifest));
   return { dir, stdout, statusPath, manifestPath: path.join(dir, 'manifest.json') };
 }
+
+const STALE_NOW = Date.parse('2026-12-01T00:00:00.000Z');
+const RESULT_ENDED = '2026-11-01T01:30:00.000Z';
+
+function staleServer(root, runs) {
+  return {
+    runsRoot: runs,
+    sessionsRoot: path.join(root, 'sessions'),
+    publicDir: path.join(root, 'missing-public'),
+    now: () => STALE_NOW,
+  };
+}
+
+function findRun(body, id) {
+  return body.runs.find(run => run.run_id === id);
+}
+
+async function fixtureBytes(dir, base = dir, out = new Map()) {
+  const entries = await readdir(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) await fixtureBytes(full, base, out);
+    else if (entry.isFile()) out.set(path.relative(base, full), await readFile(full));
+  }
+  return out;
+}
+
+function assertSameBytes(left, right) {
+  assert.deepEqual([...left.keys()].sort(), [...right.keys()].sort());
+  for (const key of left.keys()) assert.deepEqual(left.get(key), right.get(key));
+}
+
+test('historical started run with a success result snapshots as completed', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'live-monitor-stale-hist-'));
+  const runs = path.join(root, 'runs');
+  await mkdir(runs);
+  try {
+    const written = await writeRun(runs, {
+      id: 'hist-success',
+      status: 'started',
+      lines: [resultLine({ inputTokens: 1, outputTokens: 1 }, RESULT_ENDED)],
+    });
+    await writeFile(written.statusPath, `${JSON.stringify({
+      v: 1, seq: 1, ts: '2026-11-01T00:00:01.000Z', run_id: 'hist-success', phase: 'code', status: 'started', exit_code: 17, reason: 'running',
+    })}\n`);
+    await withServer(staleServer(root, runs), async monitor => {
+      const run = findRun(await snapshot(monitor), 'hist-success');
+      assert.equal(run.status, 'completed');
+      assert.equal(run.timings.ended_at, RESULT_ENDED);
+      assert.equal(run.timings.duration_ms, Date.parse(RESULT_ENDED) - Date.parse('2026-11-01T00:00:00.000Z'));
+      assert.equal(run.exit_code, 17);
+      assert.equal(run.status_reason, 'running');
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test('appended success result reports completed over SSE and on a fresh snapshot', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'live-monitor-stale-live-'));
+  const runs = path.join(root, 'runs');
+  await mkdir(runs);
+  try {
+    const written = await writeRun(runs, {
+      id: 'live-success',
+      status: 'started',
+      lines: [JSON.stringify({ type: 'assistant', timestamp_ms: 1, model_call_id: 'c', message: { content: [{ type: 'text', text: 'working' }] } })],
+    });
+    await withServer(staleServer(root, runs), async monitor => {
+      const events = openEvents(monitor);
+      try {
+        await waitFor(async () => findRun(await snapshot(monitor), 'live-success'));
+        await appendFile(written.stdout, `${resultLine({ inputTokens: 2, outputTokens: 1 }, RESULT_ENDED)}\n`);
+        const statusEvent = await waitFor(() => events.events.find(item => item.event === 'status' && item.data.run_id === 'live-success' && item.data.status === 'completed') || null);
+        assert.equal(statusEvent.data.status, 'completed');
+        assert.equal(statusEvent.data.exit_code, null);
+        const run = findRun(await snapshot(monitor), 'live-success');
+        assert.equal(run.status, 'completed');
+        assert.equal(run.timings.ended_at, RESULT_ENDED);
+        assert.equal(run.exit_code, null);
+      } finally {
+        await events.stop();
+      }
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test('error results infer failed without inventing an exit code', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'live-monitor-stale-error-'));
+  const runs = path.join(root, 'runs');
+  await mkdir(runs);
+  try {
+    await writeRun(runs, {
+      id: 'flagged-error',
+      status: 'started',
+      lines: [JSON.stringify({ type: 'result', subtype: 'cancelled', is_error: true, timestamp: '2026-11-01T02:00:00.000Z', result: 'nope' })],
+    });
+    await writeRun(runs, {
+      id: 'subtype-error',
+      status: 'started',
+      lines: [JSON.stringify({ type: 'result', subtype: 'error_during_execution', timestamp: '2026-11-01T02:05:00.000Z', result: 'bad' })],
+    });
+    await withServer(staleServer(root, runs), async monitor => {
+      const body = await snapshot(monitor);
+      const flagged = findRun(body, 'flagged-error');
+      assert.equal(flagged.status, 'failed');
+      assert.equal(flagged.timings.ended_at, '2026-11-01T02:00:00.000Z');
+      assert.equal(flagged.exit_code, null);
+      assert.equal(flagged.status_reason, null);
+      const subtype = findRun(body, 'subtype-error');
+      assert.equal(subtype.status, 'failed');
+      assert.equal(subtype.timings.ended_at, '2026-11-01T02:05:00.000Z');
+      assert.equal(subtype.exit_code, null);
+      assert.equal(subtype.status_reason, null);
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test('real terminal status overrides a conflicting cursor result in both orders', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'live-monitor-stale-override-'));
+  const runs = path.join(root, 'runs');
+  await mkdir(runs);
+  const assistant = JSON.stringify({ type: 'assistant', timestamp_ms: 1, model_call_id: 'c', message: { content: [{ type: 'text', text: 'working' }] } });
+  try {
+    const thenFailed = await writeRun(runs, { id: 'result-then-failed', status: 'started', lines: [assistant] });
+    const thenCompleted = await writeRun(runs, { id: 'result-then-completed', status: 'started', lines: [assistant] });
+    const alreadyCompleted = await writeRun(runs, {
+      id: 'completed-then-result',
+      status: 'completed',
+      ended: '2026-11-01T04:00:00.000Z',
+      lines: [assistant],
+    });
+    await writeFile(alreadyCompleted.statusPath, `${JSON.stringify({
+      v: 1, seq: 1, ts: '2026-11-01T04:00:00.000Z', run_id: 'completed-then-result', phase: 'code', status: 'completed', reason: 'shipped', exit_code: 0,
+    })}\n`);
+    const alreadyFailed = await writeRun(runs, {
+      id: 'failed-then-result',
+      status: 'failed',
+      ended: '2026-11-01T03:00:00.000Z',
+      lines: [assistant],
+    });
+    await writeFile(alreadyFailed.statusPath, `${JSON.stringify({
+      v: 1, seq: 1, ts: '2026-11-01T03:00:00.000Z', run_id: 'failed-then-result', phase: 'code', status: 'failed', reason: 'boom', exit_code: 2,
+    })}\n`);
+    await withServer(staleServer(root, runs), async monitor => {
+      const events = openEvents(monitor);
+      try {
+        await waitFor(async () => findRun(await snapshot(monitor), 'result-then-failed')?.status === 'started');
+        await appendFile(thenFailed.stdout, `${resultLine({ inputTokens: 1, outputTokens: 1 }, RESULT_ENDED)}\n`);
+        const inferredFail = await waitFor(async () => {
+          const run = findRun(await snapshot(monitor), 'result-then-failed');
+          return run?.status === 'completed' && run.timings.ended_at === RESULT_ENDED ? run : null;
+        });
+        assert.equal(inferredFail.exit_code, null);
+        await appendFile(thenFailed.statusPath, `${JSON.stringify({
+          v: 1, seq: 2, ts: '2026-11-01T05:00:00.000Z', run_id: 'result-then-failed', phase: 'code', status: 'failed', reason: 'boom', exit_code: 2,
+        })}\n`);
+        const failed = await waitFor(async () => {
+          const run = findRun(await snapshot(monitor), 'result-then-failed');
+          return run?.status === 'failed' && run.timings.ended_at === '2026-11-01T05:00:00.000Z' ? run : null;
+        });
+        assert.equal(failed.status_reason, 'boom');
+        assert.equal(failed.exit_code, 2);
+
+        await appendFile(thenCompleted.stdout, `${JSON.stringify({ type: 'result', subtype: 'error_during_execution', timestamp: '2026-11-01T02:05:00.000Z' })}\n`);
+        await waitFor(async () => findRun(await snapshot(monitor), 'result-then-completed')?.status === 'failed');
+        await appendFile(thenCompleted.statusPath, `${JSON.stringify({
+          v: 1, seq: 2, ts: '2026-11-01T06:00:00.000Z', run_id: 'result-then-completed', phase: 'code', status: 'completed', reason: 'shipped', exit_code: 0,
+        })}\n`);
+        const completed = await waitFor(async () => {
+          const run = findRun(await snapshot(monitor), 'result-then-completed');
+          return run?.status === 'completed' && run.timings.ended_at === '2026-11-01T06:00:00.000Z' ? run : null;
+        });
+        assert.equal(completed.status_reason, 'shipped');
+        assert.equal(completed.exit_code, 0);
+
+        const seededCompleted = findRun(await snapshot(monitor), 'completed-then-result');
+        assert.equal(seededCompleted.status, 'completed');
+        assert.equal(seededCompleted.timings.ended_at, '2026-11-01T04:00:00.000Z');
+        await appendFile(alreadyCompleted.stdout, `${JSON.stringify({ type: 'result', subtype: 'error', is_error: true, timestamp: RESULT_ENDED })}\n`);
+        await waitFor(() => events.events.find(item => item.event === 'stdout' && item.data.run_id === 'completed-then-result' && String(item.data.line).includes('is_error')) || null);
+        const stillCompleted = findRun(await snapshot(monitor), 'completed-then-result');
+        assert.equal(stillCompleted.status, 'completed');
+        assert.equal(stillCompleted.timings.ended_at, '2026-11-01T04:00:00.000Z');
+        assert.equal(stillCompleted.status_reason, 'shipped');
+        assert.equal(stillCompleted.exit_code, 0);
+
+        const seededFailed = findRun(await snapshot(monitor), 'failed-then-result');
+        assert.equal(seededFailed.status, 'failed');
+        assert.equal(seededFailed.timings.ended_at, '2026-11-01T03:00:00.000Z');
+        await appendFile(alreadyFailed.stdout, `${resultLine({ inputTokens: 3, outputTokens: 1 }, '2026-11-01T07:00:00.000Z')}\n`);
+        await waitFor(() => events.events.find(item => item.event === 'stdout' && item.data.run_id === 'failed-then-result' && String(item.data.line).includes('inputTokens')) || null);
+        const stillFailed = findRun(await snapshot(monitor), 'failed-then-result');
+        assert.equal(stillFailed.status, 'failed');
+        assert.equal(stillFailed.timings.ended_at, '2026-11-01T03:00:00.000Z');
+        assert.equal(stillFailed.status_reason, 'boom');
+        assert.equal(stillFailed.exit_code, 2);
+      } finally {
+        await events.stop();
+      }
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test('missing, malformed, and unrecognized results leave a started run unchanged', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'live-monitor-stale-ignore-'));
+  const runs = path.join(root, 'runs');
+  await mkdir(runs);
+  try {
+    await writeRun(runs, {
+      id: 'missing-result',
+      status: 'started',
+      lines: [JSON.stringify({ type: 'assistant', timestamp_ms: 1, model_call_id: 'c', message: { content: [{ type: 'text', text: 'working' }] } })],
+    });
+    await writeRun(runs, { id: 'malformed-result', status: 'started', lines: ['{"type":"result"'] });
+    await writeRun(runs, {
+      id: 'unknown-result',
+      status: 'started',
+      lines: [JSON.stringify({ type: 'result', subtype: 'aborted', is_error: false, timestamp: RESULT_ENDED })],
+    });
+    await writeRun(runs, {
+      id: 'success-no-time',
+      status: 'started',
+      lines: [JSON.stringify({ type: 'result', subtype: 'success', is_error: false })],
+    });
+    await writeRun(runs, {
+      id: 'success-bad-time',
+      status: 'started',
+      lines: [JSON.stringify({ type: 'result', subtype: 'success', is_error: false, timestamp: 'not-a-time' })],
+    });
+    await withServer(staleServer(root, runs), async monitor => {
+      const body = await snapshot(monitor);
+      for (const id of ['missing-result', 'malformed-result', 'unknown-result']) {
+        const run = findRun(body, id);
+        assert.equal(run.status, 'started', id);
+        assert.equal(run.timings.ended_at, null, id);
+        assert.equal(run.exit_code, null, id);
+      }
+      for (const id of ['success-no-time', 'success-bad-time']) {
+        const run = findRun(body, id);
+        assert.equal(run.status, 'completed', id);
+        assert.equal(run.timings.ended_at, null, id);
+        assert.equal(run.exit_code, null, id);
+        assert.equal(run.timings.duration_ms, STALE_NOW - Date.parse('2026-11-01T00:00:00.000Z'), id);
+      }
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test('restart infers the same outcome and does not write run files', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'live-monitor-stale-restart-'));
+  const runs = path.join(root, 'runs');
+  await mkdir(runs);
+  try {
+    const written = await writeRun(runs, {
+      id: 'hist-success',
+      status: 'started',
+      lines: [resultLine({ inputTokens: 1, outputTokens: 1 }, RESULT_ENDED)],
+    });
+    await writeFile(written.statusPath, `${JSON.stringify({
+      v: 1, seq: 1, ts: '2026-11-01T00:00:01.000Z', run_id: 'hist-success', phase: 'code', status: 'started', exit_code: 17,
+    })}\n`);
+    const before = await fixtureBytes(runs);
+    let first;
+    await withServer(staleServer(root, runs), async monitor => {
+      const run = findRun(await snapshot(monitor), 'hist-success');
+      first = { status: run.status, ended_at: run.timings.ended_at, exit_code: run.exit_code };
+      assertSameBytes(before, await fixtureBytes(runs));
+    });
+    assertSameBytes(before, await fixtureBytes(runs));
+    let second;
+    await withServer(staleServer(root, runs), async monitor => {
+      const run = findRun(await snapshot(monitor), 'hist-success');
+      second = { status: run.status, ended_at: run.timings.ended_at, exit_code: run.exit_code };
+      assertSameBytes(before, await fixtureBytes(runs));
+    });
+    assertSameBytes(before, await fixtureBytes(runs));
+    assert.deepEqual(second, first);
+    assert.equal(first.status, 'completed');
+    assert.equal(first.ended_at, RESULT_ENDED);
+    assert.equal(first.exit_code, 17);
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
 
 test('snapshot cursor_usage sums historical Cursor runs and ignores Codex', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'live-monitor-cursor-usage-'));
