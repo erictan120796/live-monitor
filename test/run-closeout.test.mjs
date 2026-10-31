@@ -10,7 +10,7 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const windows = process.platform === 'win32';
 const temps = [];
 const copies = [
-  { name: 'live', script: path.join(root, '.bin-staging', 'run-common.ps1') },
+  { name: 'live', script: path.join(root, 'wrappers', 'live', 'run-common.ps1') },
   { name: 'repo', script: path.join(root, 'wrappers', 'run-common.ps1') },
 ];
 
