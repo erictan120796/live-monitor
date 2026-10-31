@@ -106,11 +106,12 @@ winTest('Test-PromptSecret and ConvertTo-TagString', async () => {
     $emptyThrew = $false; try { ConvertTo-TagString @{ task_type = '' } | Out-Null } catch { $emptyThrew = $true }
     $semiThrew = $false; try { ConvertTo-TagString @{ task_type = 'a;b' } | Out-Null } catch { $semiThrew = $true }
     $hugeThrew = $false; try { ConvertTo-TagString @{ template = '${'a'.repeat(65)}' } | Out-Null } catch { $hugeThrew = $true }
+    $nlThrew = $false; try { ConvertTo-TagString @{ task_type = "bugfix\`n" } | Out-Null } catch { $nlThrew = $true }
     ConvertTo-Json -InputObject ([ordered]@{
       positives = $pos; negatives = $neg; sorted = $sorted; long = $long
       nullTags = (ConvertTo-TagString $null); emptyTags = (ConvertTo-TagString @{})
       unknownThrew = $unknownThrew; caseThrew = $caseThrew; badThrew = $badThrew
-      emptyThrew = $emptyThrew; semiThrew = $semiThrew; hugeThrew = $hugeThrew
+      emptyThrew = $emptyThrew; semiThrew = $semiThrew; hugeThrew = $hugeThrew; nlThrew = $nlThrew
     }) -Compress -Depth 4
   `);
   assert.equal(result.status, 0, result.stderr || result.stdout || String(result.error));
@@ -127,6 +128,7 @@ winTest('Test-PromptSecret and ConvertTo-TagString', async () => {
   assert.equal(parsed.emptyThrew, true);
   assert.equal(parsed.semiThrew, true);
   assert.equal(parsed.hugeThrew, true);
+  assert.equal(parsed.nlThrew, true);
 });
 
 async function save(prompt, promptPath, runDir, store) {

@@ -35,7 +35,7 @@ function ConvertTo-TagString {
         }
         if (-not $known) { throw "Unknown tag key: $name" }
         $value = [string]$Tags[$key]
-        if (-not [regex]::IsMatch($value, '^[A-Za-z0-9._/-]{1,64}$')) { throw "Invalid tag value for ${name}" }
+        if (-not [regex]::IsMatch($value, '\A[A-Za-z0-9._/-]{1,64}\z')) { throw "Invalid tag value for ${name}" }
         $rows += [pscustomobject]@{ Key = $name; Value = $value }
     }
     $parts = foreach ($row in ($rows | Sort-Object -Property Key)) { $row.Key + '=' + $row.Value }
@@ -62,7 +62,19 @@ function Save-PromptTrace {
         # Content-addressed: write a missing hash once. Never overwrite or delete.
         if (-not [IO.File]::Exists($storePath)) {
             [void][IO.Directory]::CreateDirectory($StoreRoot)
-            [IO.File]::WriteAllText($storePath, $Prompt, $utf8)
+            $stream = $null
+            try {
+                try {
+                    $stream = [IO.File]::Open($storePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+                } catch [System.IO.IOException] {
+                    if (-not [IO.File]::Exists($storePath)) { throw }
+                }
+                if ($null -ne $stream) {
+                    [void]$stream.Write($bytes, 0, $bytes.Length)
+                }
+            } finally {
+                if ($null -ne $stream) { $stream.Dispose() }
+            }
         }
     }
     # Comma keeps the dictionary intact; otherwise the pipeline unrolls it.
