@@ -57,6 +57,7 @@ function ConvertFrom-TagString {
 function Get-ManifestTags {
     param([string]$RunId)
     if ([string]::IsNullOrWhiteSpace($RunId)) { return '' }
+    if ($RunId -cnotmatch '\A[0-9]{8}T[0-9]{9}Z-[0-9a-f]{32}\z') { return '' }
     try {
         $manifestPath = Join-Path (Join-Path $RunsRoot $RunId) 'manifest.json'
         if (-not [IO.File]::Exists($manifestPath)) { return '' }
@@ -210,8 +211,10 @@ foreach ($item in $promptRanked) {
     $short = $sha
     if ($sha.Length -gt 12) { $short = $sha.Substring(0, 12) }
     $shown = ''
-    $full = Join-Path $PromptStore ($sha + '.md')
-    if ([IO.File]::Exists($full)) { $shown = $full }
+    if ($sha -cmatch '\A[0-9a-f]{64}\z') {
+        $full = Join-Path $PromptStore ($sha + '.md')
+        if ([IO.File]::Exists($full)) { $shown = $full }
+    }
     $line = $short + ' ' + [string]$item.Group + ' ' + (Format-Num ([decimal]$item.Weighted))
     if (-not [string]::IsNullOrEmpty($shown)) { $line = $line + ' ' + $shown }
     Write-Output $line

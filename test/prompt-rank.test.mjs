@@ -18,6 +18,7 @@ const shaB = 'b'.repeat(64);
 const shaC = 'c'.repeat(64);
 const shaD = 'd'.repeat(64);
 const shaE = 'e'.repeat(64);
+const runWide = `20261031T000000002Z-${'b'.repeat(32)}`;
 let number = 0;
 
 after(async () => { if (testRoot) await rm(testRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 }); });
@@ -233,14 +234,14 @@ winTest('groups by scope_style, template, and flow_step with manifest tag fallba
   const manifestWide = Buffer.from('{"tags":"scope_style=wide;template=beta;flow_step=ship"}\n', 'utf8');
   const manifestIgnored = Buffer.from('{"tags":"scope_style=wide;template=nope;flow_step=nope"}\n', 'utf8');
   await mkdir(path.join(runs, 'r1'));
-  await mkdir(path.join(runs, 'r2'));
+  await mkdir(path.join(runs, runWide));
   await mkdir(path.join(runs, 'r3'));
   await writeFile(path.join(runs, 'r1', 'manifest.json'), broken);
-  await writeFile(path.join(runs, 'r2', 'manifest.json'), manifestWide);
+  await writeFile(path.join(runs, runWide, 'manifest.json'), manifestWide);
   await writeFile(path.join(runs, 'r3', 'manifest.json'), manifestIgnored);
   const logBytes = Buffer.from(csv([
     { date: '2026-10-31 02:00', repo: 'demo', task_type: 'bug', tool: 'codex', model: 'm', effort: 'e', input_tokens: '10', output_tokens: '5', duration_s: '10', session_id: 's1', result: 'ok', notes: '', run_id: 'r1', prompt_sha256: shaA, cache_read_tokens: '0', review_verdict: 'approve', fix_round: '0', tags: 'scope_style=narrow;template=alpha;flow_step=plan' },
-    { date: '2026-10-31 02:01', repo: 'demo', task_type: 'bug', tool: 'codex', model: 'm', effort: 'e', input_tokens: '30', output_tokens: '0', duration_s: '30', session_id: 's2', result: 'ok', notes: '', run_id: 'r2', prompt_sha256: shaB, cache_read_tokens: '10', review_verdict: 'approve', fix_round: '0', tags: '' },
+    { date: '2026-10-31 02:01', repo: 'demo', task_type: 'bug', tool: 'codex', model: 'm', effort: 'e', input_tokens: '30', output_tokens: '0', duration_s: '30', session_id: 's2', result: 'ok', notes: '', run_id: runWide, prompt_sha256: shaB, cache_read_tokens: '10', review_verdict: 'approve', fix_round: '0', tags: '' },
     { date: '2026-10-31 02:02', repo: 'demo', task_type: 'bug', tool: 'codex', model: 'm', effort: 'e', input_tokens: '4', output_tokens: '1', duration_s: '4', session_id: 's3', result: 'ok', notes: '', run_id: 'r3', prompt_sha256: shaC, cache_read_tokens: '0', review_verdict: 'approve', fix_round: '0', tags: 'template=alpha' },
     { date: '2026-10-31 02:03', repo: 'demo', task_type: 'bug', tool: 'codex', model: 'm', effort: 'e', input_tokens: '1', output_tokens: '1', duration_s: '8', session_id: 's4', result: 'ok', notes: '', run_id: 'r4', prompt_sha256: shaD, cache_read_tokens: '0', review_verdict: 'approve', fix_round: '0', tags: 'flow_step=plan' },
   ]), 'utf8');
@@ -303,4 +304,43 @@ winTest('twelve-column log is tolerated and left byte-identical', async () => {
   assert.deepEqual(await readdir(runs), []);
   assert.deepEqual(await readdir(store), []);
   assert.deepEqual(promptLines(result.stdout), []);
+});
+
+winTest('skips manifest tags when run_id is not canonical', async () => {
+  const { dir, runs, store } = await workspace();
+  const logPath = path.join(dir, 'task-log.csv');
+  const outCsv = path.join(dir, 'out.csv');
+  const outside = path.join(dir, 'outside');
+  const manifest = path.join(outside, 'manifest.json');
+  assertTemp(manifest);
+  await mkdir(outside);
+  await writeFile(manifest, Buffer.from('{"tags":"scope_style=evil"}\n', 'utf8'));
+  await writeFile(logPath, csv([
+    { date: '2026-10-31 03:00', repo: 'demo', task_type: 'bug', tool: 'codex', model: 'gpt', effort: 'high', input_tokens: '10', output_tokens: '0', duration_s: '7', session_id: 's1', result: 'ok', notes: '', run_id: '..\\outside', prompt_sha256: shaA, cache_read_tokens: '0', review_verdict: 'approve', fix_round: '0', tags: '' },
+  ]));
+  const ranked = await run(argsOf({ logPath, runs, store, outCsv, groupBy: 'scope_style' }));
+  assert.equal(ranked.code, 0, `${ranked.stderr}\n${ranked.stdout}`);
+  assert.equal(`${ranked.stdout}\n${await readFile(outCsv, 'utf8')}`.includes('evil'), false);
+  assert.deepEqual(parseCsv(await readFile(outCsv, 'utf8')).map(pick), [
+    { group: '(none)', runs: '1', successes: '1', success_rate: '1.00', median_duration_s: '7', median_input_tokens: '10', median_output_tokens: '0', median_cache_read_tokens: '0', cost_per_success: '10' },
+  ]);
+});
+
+winTest('omits prompt store path when prompt_sha256 is not 64 hex chars', async () => {
+  const { dir, runs, store } = await workspace();
+  const logPath = path.join(dir, 'task-log.csv');
+  const bait = path.join(dir, 'x.md');
+  assertTemp(bait);
+  await writeFile(bait, Buffer.from('bait\n', 'utf8'));
+  await writeFile(logPath, csv([
+    { date: '2026-10-31 03:01', repo: 'demo', task_type: 'bug', tool: 'codex', model: 'gpt', effort: 'high', input_tokens: '10', output_tokens: '0', duration_s: '7', session_id: 's1', result: 'ok', notes: '', run_id: 'run-bad-sha', prompt_sha256: '..\\x', cache_read_tokens: '0', review_verdict: 'approve', fix_round: '0', tags: '' },
+  ]));
+  const ranked = await run(argsOf({ logPath, runs, store }));
+  assert.equal(ranked.code, 0, `${ranked.stderr}\n${ranked.stdout}`);
+  const parts = ranked.stdout.split(/Top prompts/);
+  assert.equal(parts.length, 2, ranked.stdout);
+  const lines = parts[1].split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  assert.deepEqual(lines, ['..\\x gpt/high 10']);
+  assert.equal(ranked.stdout.toLowerCase().includes('x.md'), false);
+  assert.equal(ranked.stdout.toLowerCase().includes(dir.toLowerCase()), false);
 });
