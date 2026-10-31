@@ -42,6 +42,12 @@ function ConvertTo-TagString {
     return ($parts -join ';')
 }
 
+function Test-PromptStoreCollision {
+    param([Parameter(Mandatory=$true)][System.Exception]$Exception)
+    $hr = ([int64]$Exception.HResult -band 0xFFFFFFFFL)
+    return ($hr -eq 0x80070050L -or $hr -eq 0x800700B7L)
+}
+
 function Save-PromptTrace {
     param(
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Prompt,
@@ -67,7 +73,7 @@ function Save-PromptTrace {
                 try {
                     $stream = [IO.File]::Open($storePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
                 } catch [System.IO.IOException] {
-                    if (-not [IO.File]::Exists($storePath)) { throw }
+                    if (-not (Test-PromptStoreCollision -Exception $_.Exception)) { throw }
                 }
                 if ($null -ne $stream) {
                     [void]$stream.Write($bytes, 0, $bytes.Length)
