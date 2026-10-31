@@ -192,6 +192,44 @@ winTest('invalid RunId throws and leaves the log unchanged', async () => {
   await assert.rejects(readFile(missing), err => err.code === 'ENOENT');
 });
 
+winTest('existing file without trailing newline keeps original bytes and appends its own row', async () => {
+  const { runs, logPath } = await workspace();
+  const legacy = 'date,repo,task_type,tool,model,effort,input_tokens,output_tokens,duration_s,session_id,result,notes\r\n2026-01-02 03:04,oldrepo,bug,codex,old-model,low,1,2,3,old-sess,ok,old note';
+  const original = Buffer.from(legacy, 'utf8');
+  await writeFile(logPath, original);
+  const result = await run(logPath, runs, [...base, '-Notes', 'fresh']);
+  assert.equal(result.code, 0, result.stderr);
+  const buf = await readFile(logPath);
+  assert.deepEqual(buf.subarray(0, original.length), original);
+  const rest = buf.subarray(original.length).toString('utf8');
+  assert.match(rest, /^\r\n/);
+  const lines = rest.split(/\r?\n/).filter(line => line.length > 0);
+  assert.equal(lines.length, 1);
+  const fields = parseCsvLine(lines[0]);
+  assert.equal(fields.length, 18);
+  assert.equal(fields[11], 'fresh');
+  assert.equal(buf.toString('utf8').includes('old note\r\n'), true);
+});
+
+test('five concurrent writers produce one header and five rows', { skip: !windows, timeout: 90000 }, async () => {
+  const { runs, logPath } = await workspace();
+  const notes = ['c0', 'c1', 'c2', 'c3', 'c4'];
+  const results = await Promise.all(notes.map(note => run(logPath, runs, [...base, '-Notes', note])));
+  for (const result of results) assert.equal(result.code, 0, result.stderr);
+  const buf = await readFile(logPath);
+  assert.notDeepEqual([...buf.subarray(0, 3)], [0xEF, 0xBB, 0xBF]);
+  const lines = buf.toString('utf8').split(/\r?\n/).filter(line => line.length > 0);
+  assert.equal(lines.length, 6);
+  assert.equal(lines.filter(line => line === header).length, 1);
+  assert.equal(lines[0], header);
+  const got = lines.slice(1).map(line => {
+    const fields = parseCsvLine(line);
+    assert.equal(fields.length, 18);
+    return fields[11];
+  }).sort();
+  assert.deepEqual(got, notes);
+});
+
 winTest('comma in notes is quoted', async () => {
   const { runs, logPath } = await workspace();
   const result = await run(logPath, runs, [...base, '-Notes', 'hello, world']);

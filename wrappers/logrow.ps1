@@ -34,9 +34,34 @@ if (-not [string]::IsNullOrEmpty($RunId)) {
 $q={param($v) $s="$v"; if($s -match '[,"\r\n]'){ '"'+$s.Replace('"','""')+'"' } else { $s }}
 $row = ((Get-Date -Format 'yyyy-MM-dd HH:mm'), $Repo, $TaskType, $Tool, $Model, $Effort, $InputTokens, $OutputTokens, $DurationS, $SessionId, $Result, $Notes, $RunId, $PromptSha256, $CacheReadTokens, $ReviewVerdict, $FixRound, $Tags | ForEach-Object { & $q $_ }) -join ','
 $utf8 = New-Object Text.UTF8Encoding $false
-if (-not [IO.File]::Exists($LogPath)) {
-    $header = 'date,repo,task_type,tool,model,effort,input_tokens,output_tokens,duration_s,session_id,result,notes,run_id,prompt_sha256,cache_read_tokens,review_verdict,fix_round,tags'
-    [IO.File]::WriteAllText($LogPath, ($header + "`r`n"), $utf8)
+$header = 'date,repo,task_type,tool,model,effort,input_tokens,output_tokens,duration_s,session_id,result,notes,run_id,prompt_sha256,cache_read_tokens,review_verdict,fix_round,tags'
+$stream = $null
+try {
+    for ($attempt = 1; $attempt -le 50; $attempt++) {
+        try {
+            $stream = [IO.File]::Open($LogPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            break
+        } catch [System.IO.IOException] {
+            if ($attempt -ge 50) { throw }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    if ($stream.Length -eq 0) {
+        $bytes = $utf8.GetBytes($header + "`r`n")
+        $stream.Write($bytes, 0, $bytes.Length)
+    } else {
+        [void]$stream.Seek([int64]-1, [IO.SeekOrigin]::End)
+        $last = $stream.ReadByte()
+        if ($last -ne 0x0A) {
+            $nl = $utf8.GetBytes("`r`n")
+            [void]$stream.Seek(0, [IO.SeekOrigin]::End)
+            $stream.Write($nl, 0, $nl.Length)
+        }
+    }
+    [void]$stream.Seek(0, [IO.SeekOrigin]::End)
+    $bytes = $utf8.GetBytes($row + "`r`n")
+    $stream.Write($bytes, 0, $bytes.Length)
+} finally {
+    if ($null -ne $stream) { $stream.Dispose() }
 }
-[IO.File]::AppendAllText($LogPath, ($row + "`r`n"), $utf8)
 $row
