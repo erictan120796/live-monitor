@@ -120,8 +120,31 @@ winTest('new file gets 18-column header and row', async () => {
   assert.match(fields[0], /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
   assert.deepEqual(fields.slice(1), [
     'demo', 'bug', 'codex', 'gpt-5', 'high', '11', '22', '3', 'sess', 'ok', 'plain',
-    '', 'abc123', '9', 'approve', '1', 'task_type=bug',
+    '', 'abc123', '9', 'approve', '1',     'task_type=bug',
   ]);
+});
+
+winTest('RunId with typed tokens is refused and the same row without RunId still writes', async () => {
+  const { runs, logPath } = await workspace();
+  const runId = `20261031T105012345Z-${'0123456789abcdef'.repeat(2)}`;
+  await mkdir(path.join(runs, runId));
+  await writeFile(path.join(runs, runId, 'manifest.json'), JSON.stringify({
+    session_id: 'sess',
+    schema_version: 1,
+  }));
+  const refused = await run(logPath, runs, [...base, '-Notes', 'typed', '-RunId', runId]);
+  assert.notEqual(refused.code, 0);
+  assert.match(refused.stderr, /token values must come from the run record when -RunId is given/);
+  await assert.rejects(readFile(logPath), err => err.code === 'ENOENT');
+  const wrote = await run(logPath, runs, [...base, '-Notes', 'typed']);
+  assert.equal(wrote.code, 0, wrote.stderr);
+  const lines = (await readFile(logPath, 'utf8')).split(/\r?\n/).filter(line => line.length > 0);
+  assert.equal(lines.length, 2);
+  const fields = parseCsvLine(lines[1]);
+  assert.equal(fields[6], '11');
+  assert.equal(fields[7], '22');
+  assert.equal(fields[11], 'typed');
+  assert.equal(fields[12], '');
 });
 
 winTest('existing 12-column file is appended and original bytes stay', async () => {
@@ -147,13 +170,15 @@ winTest('manifest fills empty prompt_sha256 and tags', async () => {
   const runId = `20261031T105012345Z-${'0123456789abcdef'.repeat(2)}`;
   const sha = 'deadbeef'.repeat(8);
   const tags = 'flow_step=review;task_type=bug';
+  const runArgs = base.filter((value, index) => !['-InputTokens', '-OutputTokens', '-CacheReadTokens'].includes(value) && !['-InputTokens', '-OutputTokens', '-CacheReadTokens'].includes(base[index - 1]));
   await mkdir(path.join(runs, runId));
   await writeFile(path.join(runs, runId, 'manifest.json'), JSON.stringify({
     prompt_sha256: sha,
+    session_id: 'sess',
     tags,
     schema_version: 1,
   }));
-  const result = await run(logPath, runs, [...base, '-Notes', 'from-run', '-RunId', runId]);
+  const result = await run(logPath, runs, [...runArgs, '-Notes', 'from-run', '-RunId', runId]);
   assert.equal(result.code, 0, result.stderr);
   const lines = (await readFile(logPath, 'utf8')).split(/\r?\n/).filter(line => line.length > 0);
   const fields = parseCsvLine(lines[1]);
@@ -165,7 +190,7 @@ winTest('manifest fills empty prompt_sha256 and tags', async () => {
   const explicitLog = path.join(path.dirname(logPath), 'explicit.csv');
   assertTemp(explicitLog);
   const kept = await run(explicitLog, runs, [
-    ...base,
+    ...runArgs,
     '-Notes', 'kept',
     '-RunId', runId,
     '-PromptSha256', 'explicit-sha',

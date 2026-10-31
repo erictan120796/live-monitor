@@ -1,4 +1,4 @@
-﻿param(
+param(
     [string]$Repo,
     [string]$TaskType,
     [string]$Tool,
@@ -19,16 +19,74 @@
     [string]$LogPath = "$HOME\.orchestrator\task-log.csv",
     [string]$RunsRoot = "$HOME\.orchestrator\runs"
 )
+
+function Read-TokenField($obj, [string]$Name) {
+    if ($null -eq $obj) { return $null }
+    $prop = $obj.PSObject.Properties[$Name]
+    if ($null -eq $prop -or $null -eq $prop.Value) { return $null }
+    return $prop.Value
+}
+
+function Format-LogToken($value) {
+    if ($null -eq $value) { return '' }
+    if ($value -is [string]) { return $value }
+    return [Convert]::ToString($value, [Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Resolve-LogToken($obj, [string[]]$Names) {
+    foreach ($name in $Names) {
+        $value = Read-TokenField $obj $name
+        if ($null -ne $value) { return (Format-LogToken $value) }
+    }
+    return ''
+}
+
 $ErrorActionPreference = 'Stop'
 if (-not [string]::IsNullOrEmpty($RunId)) {
     if ($RunId -cnotmatch '\A[0-9]{8}T[0-9]{9}Z-[0-9a-f]{32}\z') {
         throw "Invalid RunId format: $RunId"
     }
     $manifestPath = Join-Path (Join-Path $RunsRoot $RunId) 'manifest.json'
-    if ([IO.File]::Exists($manifestPath)) {
-        $manifest = [IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
-        if ([string]::IsNullOrEmpty($PromptSha256)) { $PromptSha256 = [string]$manifest.prompt_sha256 }
-        if ([string]::IsNullOrEmpty($Tags)) { $Tags = [string]$manifest.tags }
+    if (-not [IO.File]::Exists($manifestPath)) {
+        throw "Run manifest not found for RunId $RunId"
+    }
+    $manifest = [IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    $sessionProp = $manifest.PSObject.Properties['session_id']
+    $manifestSession = ''
+    if ($null -ne $sessionProp -and $null -ne $sessionProp.Value) {
+        $manifestSession = [string]$sessionProp.Value
+    }
+    if ([string]::IsNullOrEmpty($manifestSession)) {
+        $threadProp = $manifest.PSObject.Properties['thread_id']
+        if ($null -ne $threadProp -and $null -ne $threadProp.Value) {
+            $manifestSession = [string]$threadProp.Value
+        }
+    }
+    if ([string]::IsNullOrEmpty($manifestSession)) {
+        throw "Run manifest session_id is empty for RunId $RunId"
+    }
+    $passedSession = ''
+    if ($PSBoundParameters.ContainsKey('SessionId')) { $passedSession = [string]$SessionId }
+    if (-not $PSBoundParameters.ContainsKey('SessionId') -or -not [string]::Equals($passedSession, $manifestSession, [StringComparison]::Ordinal)) {
+        throw 'session_id mismatch'
+    }
+    foreach ($tokenParam in @('InputTokens', 'OutputTokens', 'CacheReadTokens')) {
+        if ($PSBoundParameters.ContainsKey($tokenParam)) {
+            throw 'token values must come from the run record when -RunId is given'
+        }
+    }
+    if ([string]::IsNullOrEmpty($PromptSha256)) { $PromptSha256 = [string]$manifest.prompt_sha256 }
+    if ([string]::IsNullOrEmpty($Tags)) { $Tags = [string]$manifest.tags }
+    $endedProp = $manifest.PSObject.Properties['ended_at']
+    $endedAt = $null
+    if ($null -ne $endedProp) { $endedAt = $endedProp.Value }
+    if ($null -ne $endedAt) {
+        $tokenObj = $null
+        $tokenProp = $manifest.PSObject.Properties['tokens']
+        if ($null -ne $tokenProp -and $null -ne $tokenProp.Value) { $tokenObj = $tokenProp.Value }
+        $InputTokens = Resolve-LogToken $tokenObj @('input_tokens', 'inputTokens')
+        $OutputTokens = Resolve-LogToken $tokenObj @('output_tokens', 'outputTokens')
+        $CacheReadTokens = Resolve-LogToken $tokenObj @('cached_input_tokens', 'cache_read_input_tokens', 'cacheReadTokens')
     }
 }
 $q={param($v) $s="$v"; if($s -match '[,"\r\n]'){ '"'+$s.Replace('"','""')+'"' } else { $s }}
