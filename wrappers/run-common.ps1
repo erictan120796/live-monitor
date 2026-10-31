@@ -1,4 +1,6 @@
 # Windows PowerShell 5.1 / PowerShell 7. No agent-output pipeline.
+. (Join-Path $PSScriptRoot 'prompt-trace.ps1')
+
 function ConvertTo-WindowsArgument {
     param([AllowEmptyString()][string]$Value)
     # CommandLineToArgvW/CRT rules, including backslashes before quotes and at end.
@@ -177,10 +179,18 @@ function Invoke-AgentRun {
     [CmdletBinding()]
     param([string]$Agent, [string]$PromptFile, [string]$Phase, [string]$TaskId, [int]$Attempt,
           [string]$Model, [string]$Effort, [string]$WorkDir, [string]$OutFile,
-          [double]$TimeoutMin, [string]$RunsRoot, [string]$Executable)
+          [double]$TimeoutMin, [string]$RunsRoot, [string]$Executable,
+          [hashtable]$Tags, [string]$PromptStore)
     $ErrorActionPreference = 'Stop'
+    # Invalid tags must fail before the run directory or any launcher exists.
+    $tagString = ConvertTo-TagString $Tags
+    $runsRootExplicit = $PSBoundParameters.ContainsKey('RunsRoot') -and -not [string]::IsNullOrEmpty($RunsRoot)
     if (-not $RunsRoot) { $RunsRoot = Join-Path $HOME '.orchestrator\runs' }
     $RunsRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RunsRoot)
+    if (-not $PromptStore) {
+        if ($runsRootExplicit) { $PromptStore = Join-Path (Split-Path -Parent $RunsRoot) 'prompts' }
+        else { $PromptStore = Join-Path $HOME '.orchestrator\prompts' }
+    }
     [void][IO.Directory]::CreateDirectory($RunsRoot)
     $runId = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ') + '-' + [guid]::NewGuid().ToString('N')
     $runDir = Join-Path $RunsRoot $runId
@@ -205,6 +215,8 @@ function Invoke-AgentRun {
         cli_version = $null; thread_id = $null; session_id = $null
         reported_model = $null; ended_at = $null; exit_code = $null
         native_failure = $false; cleanup_scope = 'launched_process_only'
+        tags = $tagString
+        prompt_sha256 = $null; prompt_chars = $null; prompt_source = $null; prompt_redacted = $null
     }
     Write-RunManifest $manifestPath $manifest
     $encoding = New-Object Text.UTF8Encoding($false)
@@ -234,6 +246,10 @@ function Invoke-AgentRun {
         }
         $promptPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($PromptFile)
         $prompt = [IO.File]::ReadAllText($promptPath, [Text.Encoding]::UTF8)
+        $trace = Save-PromptTrace -Prompt $prompt -PromptPath $promptPath -RunDir $runDir -StoreRoot $PromptStore
+        foreach ($name in @('prompt_sha256', 'prompt_chars', 'prompt_source', 'prompt_redacted')) {
+            $manifest[$name] = $trace[$name]
+        }
         $manifest.executable = Resolve-AgentLauncher $Executable
         $launch = @{ executable = $manifest.executable; prefix = @(); transport = 'codex_stdin'; fileShim = $false }
         if ($Agent -eq 'cursor') { $launch = Resolve-CursorTransport $manifest.executable }
