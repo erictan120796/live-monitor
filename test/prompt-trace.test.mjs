@@ -184,6 +184,51 @@ winTest('Save-PromptTrace writes prompt.md and a content-addressed store once', 
   assert.deepEqual(await readdir(store), [`${sha}.md`]);
 });
 
+winTest('Save-PromptTrace tolerates an existing store file but propagates other IO failures', async () => {
+  const dir = await mkdtemp(path.join(testRoot, 'io-'));
+  underTemp(dir);
+  const runDir = path.join(dir, 'run');
+  const store = path.join(dir, 'prompts');
+  const prompt = 'ordinary prompt';
+  const storeFile = path.join(store, `${sha256(prompt)}.md`);
+  await mkdir(runDir);
+  await mkdir(store);
+  await writeFile(storeFile, 'existing content');
+  const result = runPS(`
+    $tempFile = [IO.Path]::GetTempFileName()
+    try {
+      $collision = $null
+      try {
+        $unexpected = [IO.File]::Open($tempFile, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $unexpected.Dispose()
+      } catch [System.IO.IOException] {
+        $collision = Test-PromptStoreCollision -Exception $_.Exception
+      }
+      $sharingCollision = $null
+      $lock = [IO.File]::Open($tempFile, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::None)
+      try {
+        try {
+          $unexpected = [IO.File]::Open($tempFile, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+          $unexpected.Dispose()
+        } catch [System.IO.IOException] {
+          $sharingCollision = Test-PromptStoreCollision -Exception $_.Exception
+        }
+      } finally { $lock.Dispose() }
+      $syntheticCollision = Test-PromptStoreCollision -Exception ([System.IO.IOException]::new('x', [int]-2147024713))
+    } finally { [IO.File]::Delete($tempFile) }
+    Save-PromptTrace -Prompt ${quotePS(prompt)} -PromptPath '' -RunDir ${quotePS(runDir)} -StoreRoot ${quotePS(store)} | Out-Null
+    ConvertTo-Json -InputObject ([ordered]@{
+      collision = $collision; sharingCollision = $sharingCollision; syntheticCollision = $syntheticCollision
+    }) -Compress
+  `);
+  assert.equal(result.status, 0, result.stderr || result.stdout || String(result.error));
+  const parsed = JSON.parse(result.stdout.replace(/^\uFEFF/, ''));
+  assert.equal(parsed.collision, true);
+  assert.equal(parsed.sharingCollision, false);
+  assert.equal(parsed.syntheticCollision, true);
+  assert.equal(await readFile(storeFile, 'utf8'), 'existing content');
+});
+
 winTest('Save-PromptTrace redacts secrets and writes nothing', async () => {
   const dir = await mkdtemp(path.join(testRoot, 'secret-'));
   const runDir = path.join(dir, 'run');
