@@ -290,7 +290,8 @@ winTest('malformed, oversized and unknown stdout stays intact without losing fin
   const stdout = await readFile(result.out, 'utf8');
   assert.equal(result.exit, 0);
   assert.equal(manifest.thread_id, 'after-noise');
-  assert.equal(statuses.at(-1).status, 'completed');
+  assert.equal(statuses.at(-1).status, 'failed');
+  assert.equal(statuses.at(-1).reason, 'no_result');
   assert.ok(stdout.replaceAll('\r\n', '\n').includes(`not JSON\n${'x'.repeat(1100000)}\n`));
   assert.ok(stdout.includes('future.unknown'));
 });

@@ -175,6 +175,229 @@ function Update-AgentMetadata {
     }
 }
 
+function Close-OrphanRuns {
+    param([string]$RunsRoot, [string]$ExcludeRunId)
+    $closed = 0
+    if (-not $RunsRoot -or -not [IO.Directory]::Exists($RunsRoot)) { return 0 }
+    $hasSeq2 = {
+        param([string]$Path)
+        if (-not $Path -or -not [IO.File]::Exists($Path)) { return $false }
+        $fs = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $reader = New-Object IO.StreamReader($fs, [Text.Encoding]::UTF8, $true)
+            while ($null -ne ($line = $reader.ReadLine())) {
+                $trim = $line.TrimStart([char]0xFEFF).Trim()
+                if (-not $trim) { continue }
+                try { $obj = $trim | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                if ($obj.seq -eq 2) { return $true }
+            }
+        } finally { $fs.Dispose() }
+        return $false
+    }
+    # alive: process running and recorded ticks missing or equal. dead: exited or pid reused.
+    $identityState = {
+        param($IdValue, $TicksValue)
+        $hasPid = $false
+        $procId = 0
+        if ($null -ne $IdValue -and "$IdValue" -match '^\d+$') {
+            $hasPid = [int]::TryParse("$IdValue", [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$procId)
+        }
+        if (-not $hasPid) { return 'nopid' }
+        $alive = $false
+        $startTicks = $null
+        if ($procId -gt 0) {
+            try {
+                $proc = Get-Process -Id $procId -ErrorAction Stop
+                if (-not $proc.HasExited) {
+                    $alive = $true
+                    try { $startTicks = $proc.StartTime.ToUniversalTime().Ticks.ToString([Globalization.CultureInfo]::InvariantCulture) } catch { $startTicks = $null }
+                }
+            } catch { $alive = $false }
+        }
+        if (-not $alive) { return 'dead' }
+        if ($null -ne $startTicks) {
+            $want = ''
+            if ($null -ne $TicksValue) { $want = "$TicksValue".Trim() }
+            if (-not [string]::IsNullOrEmpty($want) -and $want -ne $startTicks) { return 'dead' }
+        }
+        return 'alive'
+    }
+    $isOrphan = {
+        param($Row)
+        $agentState = & $identityState $Row.pid $(if ($null -ne $Row.process_started_ticks) { $Row.process_started_ticks } else { $null })
+        $agentDead = $false
+        if ($agentState -eq 'dead') { $agentDead = $true }
+        elseif ($agentState -eq 'nopid') {
+            $deadlinePassed = $false
+            if ($Row.deadline_utc) {
+                try {
+                    $deadline = [DateTime]::Parse([string]$Row.deadline_utc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+                    if ([DateTime]::UtcNow -gt $deadline) { $deadlinePassed = $true }
+                } catch { $deadlinePassed = $false }
+            }
+            if ($deadlinePassed) { $agentDead = $true }
+        }
+        if (-not $agentDead) { return $false }
+        $wrapperProp = $Row.PSObject.Properties['wrapper_pid']
+        $wrapperAbsent = ($null -eq $wrapperProp) -or ($null -eq $wrapperProp.Value) -or ("$($wrapperProp.Value)".Trim() -eq '')
+        if ($wrapperAbsent) {
+            $oldEnough = $true
+            $startedProp = $Row.PSObject.Properties['started_at']
+            if ($null -ne $startedProp -and $null -ne $startedProp.Value -and "$($startedProp.Value)".Trim()) {
+                $oldEnough = $false
+                try {
+                    $started = [DateTime]::Parse([string]$startedProp.Value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+                    if (([DateTime]::UtcNow - $started).TotalMinutes -gt 10) { $oldEnough = $true }
+                } catch { $oldEnough = $false }
+            }
+            return $oldEnough
+        }
+        $wrapperTicks = $null
+        if ($Row.PSObject.Properties['wrapper_start_ticks']) { $wrapperTicks = $Row.wrapper_start_ticks }
+        return ((& $identityState $Row.wrapper_pid $wrapperTicks) -ne 'alive')
+    }
+    $repairStatus = {
+        param([string]$Path)
+        if (-not $Path -or -not [IO.File]::Exists($Path)) { return }
+        $utf8 = New-Object Text.UTF8Encoding($false)
+        $raw = [IO.File]::ReadAllText($Path, $utf8)
+        if ($raw.Length -gt 0 -and [int][char]$raw[0] -eq 0xFEFF) { $raw = $raw.Substring(1) }
+        if ($raw.Length -eq 0) { return }
+        $endsNl = $raw.EndsWith("`n")
+        $parts = $raw.Split([char]10)
+        $lastIdx = $parts.Length - 1
+        if ($endsNl) {
+            while ($lastIdx -ge 0 -and -not $parts[$lastIdx].TrimEnd("`r").Trim()) { $lastIdx-- }
+        }
+        if ($lastIdx -lt 0) { return }
+        $lastTrim = $parts[$lastIdx].TrimEnd("`r").TrimStart([char]0xFEFF).Trim()
+        $lastValid = $false
+        if ($lastTrim) {
+            try { $null = $lastTrim | ConvertFrom-Json -ErrorAction Stop; $lastValid = $true } catch { $lastValid = $false }
+        }
+        $dropLast = (-not $endsNl) -or (-not $lastValid)
+        if (-not $dropLast) { return }
+        $kept = New-Object System.Collections.Generic.List[string]
+        for ($i = 0; $i -lt $lastIdx; $i++) {
+            $trim = $parts[$i].TrimEnd("`r").TrimStart([char]0xFEFF).Trim()
+            if (-not $trim) { continue }
+            try { $null = $trim | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            [void]$kept.Add($trim)
+        }
+        $body = ''
+        if ($kept.Count -gt 0) { $body = ([string]::Join("`n", $kept.ToArray())) + "`n" }
+        [IO.File]::WriteAllText($Path, $body, $utf8)
+    }
+    $readTerminalEvent = {
+        param($Row, [string]$RunDirectory)
+        $scan = @{ found = $false; native_failure = $false; tokens = $null }
+        $stdoutPath = $null
+        if ($Row.files -and $Row.files.PSObject.Properties['stdout'] -and $Row.files.stdout) { $stdoutPath = [string]$Row.files.stdout }
+        if (-not $stdoutPath) {
+            $fallback = Join-Path $RunDirectory 'stdout.jsonl'
+            if ([IO.File]::Exists($fallback)) { $stdoutPath = $fallback }
+        }
+        if (-not $stdoutPath -or -not [IO.File]::Exists($stdoutPath)) { return $scan }
+        $agentName = ''
+        if ($Row.PSObject.Properties['agent'] -and $Row.agent) { $agentName = [string]$Row.agent }
+        $inFs = New-Object IO.FileStream($stdoutPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $inReader = New-Object IO.StreamReader($inFs, [Text.Encoding]::UTF8, $true)
+            while ($null -ne ($outLine = $inReader.ReadLine())) {
+                $outTrim = $outLine.TrimStart([char]0xFEFF).Trim()
+                if (-not $outTrim) { continue }
+                try { $outEvent = $outTrim | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                if ($agentName -eq 'codex') {
+                    if ($outEvent.type -eq 'turn.failed' -or $outEvent.type -eq 'error') { $scan.native_failure = $true }
+                    $match = $outEvent.type -eq 'turn.completed'
+                } else {
+                    $match = $outEvent.type -eq 'result'
+                    if ($match) { $scan.native_failure = ($outEvent.is_error -eq $true) -or ([string]$outEvent.subtype -match '^error') }
+                }
+                if ($match) {
+                    $scan.found = $true
+                    $usageProp = $outEvent.PSObject.Properties['usage']
+                    $scan.tokens = $(if ($usageProp -and $null -ne $usageProp.Value) { $usageProp.Value } else { $null })
+                }
+            }
+        } finally { $inFs.Dispose() }
+        $scan.found = $scan.found -and -not $scan.native_failure
+        return $scan
+    }
+    foreach ($dir in [IO.Directory]::GetDirectories($RunsRoot)) {
+        try {
+            if ($ExcludeRunId -and ([IO.Path]::GetFileName($dir) -eq $ExcludeRunId)) { continue }
+            $manifestPath = Join-Path $dir 'manifest.json'
+            if (-not [IO.File]::Exists($manifestPath)) { continue }
+            $disk = $null
+            try { $disk = [IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8) | ConvertFrom-Json } catch { continue }
+            if (-not $disk -or $disk -is [array]) { continue }
+            if ($ExcludeRunId -and [string]$disk.run_id -eq $ExcludeRunId) { continue }
+            if ($disk.ended_at) { continue }
+            $statusPath = Join-Path $dir 'status.jsonl'
+            if (& $hasSeq2 $statusPath) { continue }
+            if (-not (& $isOrphan $disk)) { continue }
+            $lock = $null
+            try {
+                $lock = New-Object IO.FileStream((Join-Path $dir 'finalize.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+            } catch { continue }
+            try {
+                try { $disk = [IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8) | ConvertFrom-Json } catch { continue }
+                if (-not $disk -or $disk -is [array] -or $disk.ended_at) { continue }
+                if (& $hasSeq2 $statusPath) { continue }
+                if (-not (& $isOrphan $disk)) { continue }
+                $exitCode = $null
+                $exitPath = Join-Path $dir 'agent-exit.json'
+                if ([IO.File]::Exists($exitPath)) {
+                    try {
+                        $exitObj = [IO.File]::ReadAllText($exitPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+                        if ($exitObj -and -not ($exitObj -is [array]) -and [string]$exitObj.run_id -eq [string]$disk.run_id -and $null -ne $exitObj.exit_code -and -not ($exitObj.exit_code -is [string])) {
+                            $parsed = 0
+                            $exitText = "$($exitObj.exit_code)"
+                            if ($exitText -match '^-?\d+$' -and [int]::TryParse($exitText, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+                                $exitCode = $parsed
+                            }
+                        }
+                    } catch { $exitCode = $null }
+                }
+                & $repairStatus $statusPath
+                $terminalEvent = & $readTerminalEvent $disk $dir
+                $closeStatus = 'failed'
+                $closeReason = $(if ($null -ne $exitCode) { 'no_result' } else { 'killed' })
+                $tokenOut = $terminalEvent.tokens
+                if ($exitCode -is [int] -and $exitCode -ne 0) { $closeStatus = 'failed'; $closeReason = 'nonzero_exit' }
+                elseif ($terminalEvent.native_failure -or $disk.native_failure -eq $true) { $closeStatus = 'failed'; $closeReason = 'native_failure' }
+                elseif ($terminalEvent.found) { $closeStatus = 'completed'; $closeReason = $null }
+                $now = [DateTime]::UtcNow.ToString('o')
+                $session = $null
+                if ($disk.session_id) { $session = [string]$disk.session_id }
+                $record = [ordered]@{
+                    v = 1; seq = 2; ts = $now
+                    run_id = $(if ($disk.run_id) { [string]$disk.run_id } else { $null })
+                    phase = $disk.phase; status = $closeStatus
+                    exit_code = $exitCode; duration_s = $null; session_id = $session; tokens = $tokenOut
+                }
+                if ($closeReason) { $record.reason = $closeReason }
+                $line = $record | ConvertTo-Json -Compress -Depth 8
+                $writer = New-Object IO.StreamWriter($statusPath, $true, (New-Object Text.UTF8Encoding($false)))
+                try { $writer.WriteLine($line) } finally { $writer.Dispose() }
+                foreach ($pair in @(
+                    @{ Name = 'ended_at'; Value = $now },
+                    @{ Name = 'exit_code'; Value = $exitCode },
+                    @{ Name = 'tokens'; Value = $tokenOut }
+                )) {
+                    $prop = $disk.PSObject.Properties[$pair.Name]
+                    if ($prop) { $prop.Value = $pair.Value }
+                    else { $disk | Add-Member -NotePropertyName $pair.Name -NotePropertyValue $pair.Value }
+                }
+                Write-RunManifest $manifestPath $disk
+                $closed++
+            } finally { if ($lock) { $lock.Dispose() } }
+        } catch { continue }
+    }
+    return $closed
+}
+
 function Invoke-AgentRun {
     [CmdletBinding()]
     param([string]$Agent, [string]$PromptFile, [string]$Phase, [string]$TaskId, [int]$Attempt,
@@ -187,6 +410,7 @@ function Invoke-AgentRun {
     $runsRootExplicit = $PSBoundParameters.ContainsKey('RunsRoot') -and -not [string]::IsNullOrEmpty($RunsRoot)
     if (-not $RunsRoot) { $RunsRoot = Join-Path $HOME '.orchestrator\runs' }
     $RunsRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($RunsRoot)
+    try { [void](Close-OrphanRuns -RunsRoot $RunsRoot) } catch {}
     if (-not $PromptStore) {
         if ($runsRootExplicit) { $PromptStore = Join-Path (Split-Path -Parent $RunsRoot) 'prompts' }
         else { $PromptStore = Join-Path $HOME '.orchestrator\prompts' }
@@ -208,7 +432,9 @@ function Invoke-AgentRun {
         requested_model = $(if ($Model) { $Model } else { $null })
         effort = $(if ($Agent -eq 'codex' -and $Effort) { $Effort } else { $null })
         phase = $Phase; workdir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($WorkDir)
-        pid = $null; started_at = [DateTime]::UtcNow.ToString('o')
+        pid = $null; wrapper_pid = $PID
+        wrapper_start_ticks = $(try { (Get-Process -Id $PID -ErrorAction Stop).StartTime.ToUniversalTime().Ticks.ToString([Globalization.CultureInfo]::InvariantCulture) } catch { $null })
+        started_at = [DateTime]::UtcNow.ToString('o')
         files = @{ stdout = $stdout; stderr = $stderr; status = $status }
         task_id = $(if ($TaskId) { $TaskId } else { $null }); attempt = $Attempt
         executable = $Executable; transport = $null; launch_executable = $null; launch_entry_script = $null
@@ -343,6 +569,27 @@ function Invoke-AgentRun {
                     if ($tail) { Update-AgentMetadata -Line $tail -Manifest $manifest }
                 }
                 if ($terminal -eq 'completed' -and $manifest.native_failure) { $terminal = 'failed'; $reason = 'native_failure' }
+                elseif ($terminal -eq 'completed') {
+                    $sawResult = $false
+                    try {
+                        $outPath = [string]$manifest.files.stdout
+                        if ($outPath -and [IO.File]::Exists($outPath)) {
+                            $inFs = New-Object IO.FileStream($outPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+                            try {
+                                $inReader = New-Object IO.StreamReader($inFs, [Text.Encoding]::UTF8, $true)
+                                while ($null -ne ($outLine = $inReader.ReadLine())) {
+                                    $outTrim = $outLine.TrimStart([char]0xFEFF).Trim()
+                                    if (-not $outTrim) { continue }
+                                    try { $outEvent = $outTrim | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                                    if ($manifest.agent -eq 'codex') {
+                                        if ($outEvent.type -eq 'turn.completed') { $sawResult = $true; break }
+                                    } elseif ($outEvent.type -eq 'result') { $sawResult = $true; break }
+                                }
+                            } finally { $inFs.Dispose() }
+                        }
+                    } catch {}
+                    if (-not $sawResult) { $terminal = 'failed'; $reason = 'no_result' }
+                }
             }
         } catch {
             $terminal = 'failed'
@@ -355,6 +602,12 @@ function Invoke-AgentRun {
                 $record.seq = 2; $record.ts = [DateTime]::UtcNow.ToString('o'); $record.status = $terminal
                 if ($reason) { $record.reason = $reason }
                 if ($null -ne $manifest.exit_code) { $record.exit_code = $manifest.exit_code }
+                if ($reason -eq 'no_result') {
+                    $record.tokens = $null
+                    if ($manifest.session_id) { $record.session_id = [string]$manifest.session_id }
+                    elseif ($manifest.thread_id) { $record.session_id = [string]$manifest.thread_id }
+                    else { $record.session_id = $null }
+                }
                 try { $statusWriter.WriteLine(($record | ConvertTo-Json -Compress)) }
                 finally {
                     $statusWriter.Dispose()

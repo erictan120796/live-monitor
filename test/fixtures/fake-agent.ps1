@@ -56,6 +56,9 @@ switch ($env:FAKE_AGENT_MODE) {
     'cursor-failure' { [Console]::WriteLine('{"type":"result","subtype":"error_during_execution","is_error":true}') }
     'cursor' { [Console]::WriteLine('{"type":"system","subtype":"init","session_id":"cursor-session","model":"reported-model"}') }
     'unterminated' { [Console]::Write('{"type":"thread.started","thread_id":"final-thread"}'); exit 0 }
-    default { [Console]::WriteLine('{"type":"thread.started","thread_id":"fast-thread"}') }
+    default {
+        [Console]::WriteLine('{"type":"thread.started","thread_id":"fast-thread"}')
+        [Console]::WriteLine('{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}')
+    }
 }
 exit 0
